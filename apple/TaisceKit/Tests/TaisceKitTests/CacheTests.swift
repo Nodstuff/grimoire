@@ -151,7 +151,9 @@ import Testing
         let sent = try #require(server.requests.first)
         #expect(sent.path == "/api/todo/deadline" && sent.httpMethod == "POST")
         let obj = try #require(try JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: String])
-        #expect(obj == ["date": "2026-10-01", "item_id": "0-ab", "deadline": "2026-10-02", "due_at": "2026-10-02T13:30:00Z", "today": "2026-10-01"])
+        let key = try #require(obj["request_id"])
+        #expect(UUID(uuidString: key) != nil)
+        #expect(obj == ["date": "2026-10-01", "item_id": "0-ab", "deadline": "2026-10-02", "due_at": "2026-10-02T13:30:00Z", "today": "2026-10-01", "request_id": key])
         #expect(try await cache.pendingOutbox().isEmpty)
     }
 

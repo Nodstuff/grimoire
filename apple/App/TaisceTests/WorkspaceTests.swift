@@ -112,7 +112,7 @@ private let docs = [
         try await cache.storeDoc(todo("t1", "unsorted thing"))
         try await cache.storeDoc(todo("t2", "home thing"))
         // offline: plans from every cached list
-        c.connect(cache: cache, api: nil, sync: nil)
+        c.connect(cache: cache, replay: nil, sync: nil)
         await c.reconcile()
         #expect(Set(center.pendingByID.values.map(\.title)) == ["unsorted thing", "home thing"])
         #expect(Set(c.lists.values) == [.unsorted, .id("w2")])

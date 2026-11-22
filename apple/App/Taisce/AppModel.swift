@@ -121,6 +121,7 @@ final class AppModel {
     private var updatesTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var replaying = false
+    private var replayAgain = false
     private var todoObserveTask: Task<Void, Never>?
     private var observedTodoDoc: DocID?
     /// rendered blocks by (block id, content hash), shared across doc views
@@ -478,6 +479,10 @@ final class AppModel {
             let dir = try AppPaths.supportDirectory()
             let name = "cache-\(url.host() ?? "server")-\(url.port ?? 0).sqlite"
             let cache = try Cache(path: dir.appending(path: name).path(percentEncoded: false))
+            // crash recovery: a write a killed app left in flight goes again
+            // (its request_id makes that safe); later replays never take one
+            // that is in flight
+            _ = try? await cache.releaseInflight()
             authPhase = .checking
             let auth = withAuth ? try await discover(url) : nil
             let api = APIClient(config: ServerConfig(baseURL: url, tokenProvider: auth ?? NoAuth()))
@@ -494,7 +499,7 @@ final class AppModel {
             self.api = api
             let sync = SyncEngine(api: api, cache: cache)
             self.sync = sync
-            dueAlerts.connect(cache: cache, api: api, sync: sync)
+            dueAlerts.connect(cache: cache, replay: { [weak self] in await self?.replayOutbox() }, sync: sync)
             pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
             await loadCachedWorkspaces(cache) // workspaces
             editMeta = [:]
@@ -611,12 +616,30 @@ final class AppModel {
     }
 
     /// Send queued writes in order. Single-flight; failures stay on the row.
+    /// Every replay in the app comes through here (a due alert's action
+    /// too). A call while one runs makes it go round once more, so a write
+    /// queued after it read the queue still goes now, not at the next poll.
     func replayOutbox() async {
         // never send one person's queued writes under another's token
-        guard let api, let cache, !replaying, mayReplay else { return }
+        guard api != nil, cache != nil, mayReplay else { return }
+        guard !replaying else {
+            replayAgain = true
+            return
+        }
         replaying = true
         defer { replaying = false }
-        let report = try? await OutboxReplayer(api: api, cache: cache).replay()
+        var report: OutboxReplayer.Report?
+        repeat {
+            replayAgain = false
+            guard let api, let cache, mayReplay else { break }
+            guard let round = try? await OutboxReplayer(api: api, cache: cache).replay() else { continue }
+            var sum = report ?? OutboxReplayer.Report()
+            sum.forbidden += round.forbidden
+            sum.gone += round.gone
+            sum.refusedMoves += round.refusedMoves
+            report = sum
+        } while replayAgain
+        guard let cache else { return }
         pendingWrites = (try? await cache.pendingOutbox().count) ?? pendingWrites
         if pendingWrites == 0 { todoRevision += 1 }
         if let report, report.forbidden > 0 {

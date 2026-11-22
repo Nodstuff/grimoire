@@ -97,7 +97,7 @@ final class StalledAlertCenter: DueAlertCenter {
         let c = coordinator(center)
         let cache = try Cache.inMemory()
         // no API: offline, the writes only queue
-        c.connect(cache: cache, api: nil, sync: nil)
+        c.connect(cache: cache, replay: nil, sync: nil)
         let inputs = [input("a", inHours: 1), input("b", inHours: 1)]
         await c.reconcile(with: inputs)
         #expect(center.pendingByID.count == 2)
@@ -139,7 +139,7 @@ final class StalledAlertCenter: DueAlertCenter {
         let tz = dublin
         let start = Date(timeIntervalSince1970: 1_792_887_000)  // 2026-10-25T00:10:00Z
         let c = NotificationCoordinator(center: center, now: { start }, timeZone: { tz })
-        c.connect(cache: try Cache.inMemory(), api: nil, sync: nil)
+        c.connect(cache: try Cache.inMemory(), replay: nil, sync: nil)
         let item = DueAlertInput(day: "2026-10-24", itemID: "a", title: "t", docTitle: "To-do", kind: .timed(start.addingTimeInterval(600)))
         await c.reconcile(with: [item])
         await center.onAction?(.snooze, "2026-10-24", "a")

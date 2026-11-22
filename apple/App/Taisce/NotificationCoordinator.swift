@@ -46,7 +46,9 @@ final class NotificationCoordinator: DueAlertPermission {
     @ObservationIgnored private let now: @MainActor () -> Date
     @ObservationIgnored private let timeZone: @MainActor () -> TimeZone
     @ObservationIgnored private var cache: Cache?
-    @ObservationIgnored private var api: APIClient?
+    /// sends the queued writes: AppModel's single-flight replay, gated on
+    /// the cache being the signed-in person's (nil = offline / no server)
+    @ObservationIgnored private var replay: (@MainActor () async -> Void)?
     /// actions answered locally that the cached To-do doc doesn't show yet
     @ObservationIgnored private(set) var overrides: [String: DueAlertOverride] = [:]
     /// actions that arrived before a cache was connected (a cold launch)
@@ -93,12 +95,14 @@ final class NotificationCoordinator: DueAlertPermission {
 
     // MARK: wiring
 
-    /// The server's cache and API (for replaying the outbox after an
-    /// action). Follows `sync` and reconciles after updates that touch the
+    /// The server's cache and how to send its outbox after an action
+    /// (always AppModel's `replayOutbox`: a replay of its own here ran
+    /// beside the app's, could send a write twice, and skipped the owner
+    /// gate). Follows `sync` and reconciles after updates that touch the
     /// To-do doc.
-    func connect(cache: Cache, api: APIClient?, sync: SyncEngine?) {
+    func connect(cache: Cache, replay: (@MainActor () async -> Void)?, sync: SyncEngine?) {
         self.cache = cache
-        self.api = api
+        self.replay = replay
         overrides = [:]
         followTask?.cancel()
         // the first reconcile comes from AppModel.startSync
@@ -226,9 +230,7 @@ final class NotificationCoordinator: DueAlertPermission {
         } catch {
             return
         }
-        if let api {
-            try? await OutboxReplayer(api: api, cache: cache).replay()
-        }
+        await replay?()
         await reconcile(with: lastInputs)
     }
 }

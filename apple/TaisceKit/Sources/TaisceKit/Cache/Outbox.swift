@@ -273,14 +273,29 @@ extension Cache {
 
     /// Take a pending entry for sending: marks it inflight and returns it
     /// as of that moment, in one write (a coalescing save can't slip a new
-    /// body in between reading and sending).
+    /// body in between reading and sending). An entry already in flight is
+    /// another replay's: never taken again here, or one write goes out
+    /// twice. One a crash left in flight is put back by `releaseInflight`.
     public func claimOutbox(_ id: Int64) async throws -> OutboxEntry? {
         try await db.write { db in
-            guard var e = try OutboxEntry.fetchOne(db, key: id), e.state == .pending || e.state == .inflight else { return nil }
+            guard var e = try OutboxEntry.fetchOne(db, key: id), e.state == .pending else { return nil }
             e.state = .inflight
             e.attempts += 1
             try e.update(db)
             return e
+        }
+    }
+
+    /// Crash recovery: entries left in flight by a replay that never
+    /// finished (the app was killed mid-send) go back in the queue. Call it
+    /// once when the cache is opened, before any replay: their answer may
+    /// have been lost, and a resend is safe because every queued write
+    /// carries its key as the server's `request_id`. Returns how many.
+    @discardableResult
+    public func releaseInflight() async throws -> Int {
+        try await db.write { db in
+            try db.execute(sql: "UPDATE outbox SET state = 'pending' WHERE state = 'inflight'")
+            return db.changesCount
         }
     }
 
@@ -384,6 +399,8 @@ public struct OutboxReplayer: Sendable {
         /// in the cache and its row settled as done, with the reason)
         public var refusedMoves: [RefusedMove] = []
 
+        public init() {}
+
         public var movesRefused: Int { refusedMoves.count }
         /// the last refused move's words, for the UI
         public var moveError: String? { refusedMoves.last?.message }
@@ -434,6 +451,7 @@ public struct OutboxReplayer: Sendable {
                             r.httpBody = try JSONEncoder().encode(req)
                         }
                     }
+                    if let body = Self.withRequestID(entry) { r.httpBody = body }
                     let data = try await api.send(raw: r)
                     let isPropose = entry.path == "/api/propose" || entry.path == "/api/propose_markdown"
                     try await cache.markOutbox(id, state: .done, outcome: isPropose ? data : nil)
@@ -490,6 +508,22 @@ public struct OutboxReplayer: Sendable {
             if !followUp { break }
         }
         return report
+    }
+
+    /// A to-do write's body with the row's key as `request_id`, so a
+    /// resend after a lost answer is not applied twice (the server dedupes
+    /// `POST /api/todo*` on it for 7 days and answers `replayed: true`; one
+    /// without it ignores the field). Only a UUID key is sent (the server
+    /// takes nothing else); nil = send the body as stored. Added here, not
+    /// at queue time, so rows queued by an older build carry it too.
+    static func withRequestID(_ e: OutboxEntry) -> Data? {
+        guard e.method == "POST", e.path == "/api/todo" || e.path.hasPrefix("/api/todo/"),
+              UUID(uuidString: e.idempotencyKey) != nil, let body = e.body,
+              var obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              obj["request_id"] == nil
+        else { return nil }
+        obj["request_id"] = e.idempotencyKey
+        return try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
     }
 
     /// `HotRegistry::assert_cold`'s refusal (crates/daemon/src/hot.rs).
