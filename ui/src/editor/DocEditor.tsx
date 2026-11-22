@@ -5,6 +5,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { EditorContent, ReactNodeViewRenderer, useEditor } from '@tiptap/react'
 import { Extension, getSchema } from '@tiptap/core'
+import { Plugin, PluginKey } from '@tiptap/pm/state'
+import { Fragment, Slice } from '@tiptap/pm/model'
 import StarterKit from '@tiptap/starter-kit'
 import CodeBlock from '@tiptap/extension-code-block'
 import { TableKit } from '@tiptap/extension-table'
@@ -60,7 +62,42 @@ const BlockId = Extension.create({
       },
     ]
   },
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: new PluginKey('blockIdPaste'),
+        props: {
+          // a pasted copy of a block still in this doc must not carry its id
+          // (two nodes, one block): it is a new block. An id the doc no
+          // longer holds (cut, then pasted) stays, so a move keeps its id;
+          // one from another doc is given a fresh id by planSave.
+          transformPasted: (slice, view) => {
+            const present = new Set<string>()
+            view.state.doc.forEach((n) => {
+              if (n.attrs.blockId) present.add(n.attrs.blockId)
+            })
+            return present.size ? new Slice(withoutIds(slice.content, present), slice.openStart, slice.openEnd) : slice
+          },
+        },
+      }),
+    ]
+  },
 })
+
+/** `frag` with every blockId in `drop` cleared, at any depth. */
+export function withoutIds(frag: Fragment, drop: Set<string>): Fragment {
+  const out: PMNode[] = []
+  frag.forEach((n) => {
+    if (n.isText) {
+      out.push(n)
+      return
+    }
+    const id = n.attrs.blockId as string | null | undefined
+    const content = withoutIds(n.content, drop)
+    out.push(id && drop.has(id) ? n.type.create({ ...n.attrs, blockId: null }, content, n.marks) : n.copy(content))
+  })
+  return Fragment.from(out)
+}
 
 /** The editor extension set. */
 export function makeExtensions() {
@@ -192,6 +229,9 @@ export default function DocEditor({
   }
   /** a save the daemon refused for good: no retry clock until the next edit */
   const [stopped, setStopped] = useState(false)
+  /** ids this editor stamped whose save has not landed yet (planSave keeps
+   * them; any other id outside the baseline is not this doc's) */
+  const ownStamped = useRef(new Set<string>())
   /** the request being retried, so a retry carries the same request_id */
   const pending = useRef<PendingRequest | null>(null)
   const stateCb = useRef(onSaveState)
@@ -301,7 +341,8 @@ export default function DocEditor({
    * inserts — under the same request_id. */
   const prepare = () => {
     if (!editor) return null
-    const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [])
+    const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [], undefined, ownStamped.current)
+    for (const st of stamps) ownStamped.current.add(st.id)
     if (stamps.length && !editor.isDestroyed) {
       const tr = editor.state.tr
       applyStamps(tr, stamps)
@@ -338,6 +379,9 @@ export default function DocEditor({
       const editedMeanwhile = !editor.state.doc.eq(snapshot)
       // new baseline = what we just wrote
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
+      // landed: these ids are the baseline's now (one deleted later and
+      // brought back by undo must not pass as a pending one of ours)
+      for (const b of baselineRef.current) ownStamped.current.delete(b.id)
       epochRef.current = out.epoch
       lastSaveError.current = null
       setFailed(false)
@@ -589,22 +633,36 @@ export interface Stamp {
   pos: number
   id: string
   type: string
+  /** the id the node carried that is not this doc's (pasted from another
+   * doc, or a block this editor saw deleted): replaced on every node of it */
+  replaces?: string | null
 }
 
 /** What one save writes: the entries (every new one already given its id),
- * the ops, and the stamps that put those ids on their nodes once it lands. */
+ * the ops, and the stamps that put those ids on their nodes once it lands.
+ * An entry keeps its id only when the baseline holds it, or this editor
+ * stamped it itself (`own`: a save not yet landed); any other id (a paste
+ * from another doc, an undo bringing back a deleted block, a second run of
+ * one id) is not this doc's block, and inserting under it is refused as
+ * "already exists": it gets a fresh one. */
 export function planSave(
   doc: PMNode,
   baseline: BaselineBlock[],
   hidden: HiddenBlock[],
   newId: () => string = () => crypto.randomUUID(),
+  own: ReadonlySet<string> = new Set(),
 ): { entries: Entry[]; ops: Op[]; stamps: Stamp[] } {
   const positions: number[] = []
   const stamps: Stamp[] = []
+  const known = new Set(baseline.map((b) => b.id))
+  const seen = new Set<string>()
   const entries = entriesOf(doc, positions).map((e, i) => {
-    if (e.id) return e
+    if (e.id && !seen.has(e.id) && (known.has(e.id) || own.has(e.id))) {
+      seen.add(e.id)
+      return e
+    }
     const id = newId()
-    stamps.push({ pos: positions[i], id, type: doc.nodeAt(positions[i])!.type.name })
+    stamps.push({ pos: positions[i], id, type: doc.nodeAt(positions[i])!.type.name, replaces: e.id })
     return { ...e, id }
   })
   const ops = computeOps(baseline, entries, newId, undefined, hidden)
@@ -619,9 +677,18 @@ export function applyStamps(tr: Transaction, stamps: Stamp[]): boolean {
   for (const s of stamps) {
     if (s.pos >= tr.doc.content.size || tr.doc.resolve(s.pos).depth !== 0) continue
     const node = tr.doc.nodeAt(s.pos)
-    if (!node || node.type.name !== s.type || node.attrs.blockId) continue
+    if (!node || node.type.name !== s.type || (node.attrs.blockId ?? null) !== (s.replaces ?? null)) continue
     tr.setNodeAttribute(s.pos, 'blockId', s.id)
     any = true
+    // a replaced id: the rest of its run (one block over several nodes) too
+    if (s.replaces) {
+      for (let p = s.pos + node.nodeSize; p < tr.doc.content.size; ) {
+        const next = tr.doc.nodeAt(p)
+        if (!next || next.attrs.blockId !== s.replaces) break
+        tr.setNodeAttribute(p, 'blockId', s.id)
+        p += next.nodeSize
+      }
+    }
   }
   return any
 }

@@ -132,8 +132,8 @@ describe('stamping new block ids after a save', () => {
     const plan = planSave(doc, baseline, [], newId)
     const tr = EditorState.create({ schema, doc }).tr
     applyStamps(tr, plan.stamps)
-    // the request failed: the baseline did not move
-    const retry = planSave(tr.doc, baseline, [], newId)
+    // the request failed: the baseline did not move; the ids are the editor's own
+    const retry = planSave(tr.doc, baseline, [], newId, new Set(plan.stamps.map((s) => s.id)))
     expect(retry.ops).toEqual(plan.ops)
     expect(retry.stamps).toEqual([])
   })
@@ -144,5 +144,40 @@ describe('stamping new block ids after a save', () => {
     const entries = entriesOf(doc, positions)
     expect(positions).toHaveLength(entries.length)
     positions.forEach((p, i) => expect(doc.nodeAt(p)!.attrs.blockId).toBe(entries[i].id))
+  })
+})
+
+describe('ids that are not this doc\'s', () => {
+  const blocks = [block('t', '# T', null, 'i'), block('x', 'text', 't', 'i')]
+  it('a block pasted from another doc (its id unknown here) is inserted under a fresh id, every node of it restamped', () => {
+    const foreign = md('one\n\ntwo').map((n) => n.type.create({ ...n.attrs, blockId: 'other-doc-block' }, n.content))
+    const { doc, baseline } = docWith(blocks, foreign)
+    const plan = planSave(doc, baseline, [], newId)
+    const inserts = plan.ops.filter((o) => o.kind.op === 'insert')
+    expect(inserts).toHaveLength(1)
+    expect(inserts[0].kind.block_id).not.toBe('other-doc-block')
+    const tr = EditorState.create({ schema, doc }).tr
+    applyStamps(tr, plan.stamps)
+    expect(idOfText(tr.doc, 'one')).toBe(inserts[0].kind.block_id)
+    expect(idOfText(tr.doc, 'two')).toBe(inserts[0].kind.block_id)
+    expect(planSave(tr.doc, rebuildBaseline(baseline, plan.entries, plan.ops), [], newId).ops).toEqual([])
+  })
+
+  it('a block this editor saw deleted, brought back by undo, is a new insert, not a refused one', () => {
+    const { doc, baseline } = docWith(blocks, [])
+    // "x" was deleted and saved: the baseline no longer holds it; undo brings the node back
+    const after = baseline.filter((b) => b.id !== 'x')
+    const ops = planSave(doc, after, [], newId).ops
+    expect(ops).toHaveLength(1)
+    expect(ops[0].kind.op).toBe('insert')
+    expect(ops[0].kind.block_id).not.toBe('x')
+  })
+
+  it('a second run of one id becomes its own block', () => {
+    const { nodes, baseline } = loadDoc({ docId: 'd', epoch: 1, blocks })
+    const doc = schema.node('doc', null, [nodes[0], nodes[1], ...md('between'), nodes[1].type.create(nodes[1].attrs, schema.text('copy'))])
+    const ops = planSave(doc, baseline, [], newId).ops
+    expect(ops.filter((o) => o.kind.op === 'insert').map((o) => o.kind.content).sort()).toEqual(['between', 'copy'])
+    expect(ops.some((o) => o.kind.op === 'replace')).toBe(false)
   })
 })
