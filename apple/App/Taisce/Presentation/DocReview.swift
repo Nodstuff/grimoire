@@ -97,22 +97,17 @@ enum ReviewText {
 /// this week, then "19 Oct" (with the year when it isn't this one).
 enum ShortWhen {
     static func string(_ date: Date, now: Date = .now, calendar: Calendar = .current) -> String {
-        let f = DateFormatter()
-        f.calendar = calendar
-        f.timeZone = calendar.timeZone
-        f.locale = calendar.locale ?? .current
+        let locale = calendar.locale ?? .current
         if calendar.isDate(date, inSameDayAs: now) {
-            f.setLocalizedDateFormatFromTemplate("jj:mm")
-            return f.string(from: date)
+            return DateFormats.formatter("jj:mm", calendar: calendar, locale: locale).string(from: date)
         }
         let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day ?? 0
         if days == 1 { return "Yest." }
         if days > 1, days < 7 {
-            f.setLocalizedDateFormatFromTemplate("EEE")
-            return f.string(from: date)
+            return DateFormats.formatter("EEE", calendar: calendar, locale: locale).string(from: date)
         }
-        f.setLocalizedDateFormatFromTemplate(calendar.isDate(date, equalTo: now, toGranularity: .year) ? "d MMM" : "d MMM yyyy")
-        return f.string(from: date)
+        let template = calendar.isDate(date, equalTo: now, toGranularity: .year) ? "d MMM" : "d MMM yyyy"
+        return DateFormats.formatter(template, calendar: calendar, locale: locale).string(from: date)
     }
 
     /// Inside a sentence ("edited yesterday", "edited 12:41", "edited Tue"):

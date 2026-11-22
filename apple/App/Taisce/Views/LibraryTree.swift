@@ -168,8 +168,10 @@ struct LibraryTree<Menu: View>: View {
     var pins: Set<DocID> = []
     /// open review items per doc: a flag pill (Library) or a dot (sidebar)
     var flags: [DocID: Int] = [:]
-    /// when a doc was last edited, if known (the Library's trailing time)
-    var edited: (DocID) -> Date? = { _ in nil }
+    /// when a doc was last edited, if known (the Library's trailing time):
+    /// an observable per doc, read by its row only, so a time arriving
+    /// redraws that row and not the tree
+    var edited: (DocID) -> EditedTime? = { _ in nil }
     var style: DocTreeStyle = .sidebar
     let onOpen: (DocID) -> Void
     /// a row came on screen
@@ -198,7 +200,7 @@ struct LibraryTree<Menu: View>: View {
                     selected: selected == line.id,
                     pinned: pins.contains(line.id),
                     flags: (flags.isEmpty ? model?.reviewCounts.counts[line.id] : flags[line.id]) ?? 0,
-                    edited: line.node.isFolder ? nil : edited(line.id),
+                    editedTime: line.node.isFolder ? nil : edited(line.id),
                     separator: style == .library && i > 0,
                     hover: hover?.id == line.id ? hover?.zone : nil,
                     mover: docMover,
@@ -214,7 +216,11 @@ struct LibraryTree<Menu: View>: View {
                 )
                 .contextMenu { menu(line.node) }
                 .id(line.id)
-                .onAppear { if style == .library, !line.node.isFolder { onRowAppear(line.id) } }
+                // on screen, not merely built: the stack builds every row, and a
+                // row's edited time is a request of its own
+                .onScrollVisibilityChange(threshold: 0.01) { visible in
+                    if visible, style == .library, !line.node.isFolder { onRowAppear(line.id) }
+                }
                 if line.isOpen, line.node.children == nil {
                     EmptyFolderLine(folder: line.id, depth: line.depth + 1, style: style, mover: docMover) {
                         withAnimation(.snappy(duration: 0.2)) { _ = expanded.insert(line.id) }
@@ -344,8 +350,9 @@ private struct DocTreeRow: View {
     let pinned: Bool
     /// open review items on this doc
     var flags = 0
-    /// when the doc was last edited (Library rows)
-    var edited: Date?
+    /// when the doc was last edited (Library rows); read here, in the row
+    var editedTime: EditedTime?
+    private var edited: Date? { editedTime?.date }
     /// a hairline above (Library rows after the first)
     var separator = false
     /// the zone a drag is over on this row (nil: none here)

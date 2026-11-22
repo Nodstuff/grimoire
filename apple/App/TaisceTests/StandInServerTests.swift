@@ -13,12 +13,15 @@ final class HeldServer: URLProtocol {
     static let log = Mutex<[URLRequest]>([])
     static let held = Mutex<[String]>([])
     static let routes = Mutex<[String: String]>([:])
+    /// every path asked, in order
+    static let hits = Mutex<[String]>([])
     static let todoDay = #"{"carried":0,"date":"2026-10-01","doc_id":"t","epoch":3,"items":[],"prev_date":null,"today":"2026-10-01"}"#
 
     static func reset() {
         log.withLock { $0 = [] }
         held.withLock { $0 = [] }
         routes.withLock { $0 = [:] }
+        hits.withLock { $0 = [] }
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -41,6 +44,7 @@ final class HeldServer: URLProtocol {
             req.httpBody = data
         }
         let path = req.url?.path() ?? ""
+        Self.hits.withLock { $0.append(path) }
         if path.hasPrefix("/api/todo") { Self.log.withLock { $0.append(req) } }
         answer(path: path, deadline: Date.now.addingTimeInterval(10))
     }
@@ -170,5 +174,40 @@ final class HeldServer: URLProtocol {
         #expect(m.library.map(\.doc.title) == ["Home doc"], "the old workspace's tree: \(m.library.map(\.doc.title))")
         m.afterTreeBuilt = nil
         try await cache.wipe()
+    }
+
+    /// Review 2026-11-22 #8: Library rows' edited times go out once per doc,
+    /// four at a time, and land together.
+    @Test func editedTimesAreFetchedOncePerDocFourAtATime() async throws {
+        URLProtocol.registerClass(HeldServer.self)
+        defer { URLProtocol.unregisterClass(HeldServer.self) }
+        HeldServer.reset()
+        defer { HeldServer.reset() }
+        let m = try await HeldServer.model()
+        let ids = (0..<10).map { "lib\($0)" }
+        let row = #"[{"op":{"id":"0199a0b0-c0d0-7abc-8def-0123456789ab","doc_id":"x","epoch_applied":4},"principal_name":"Ann","principal_kind":"human"}]"#
+        HeldServer.routes.withLock { r in for id in ids { r["/api/doc/\(id)/history"] = row } }
+        HeldServer.held.withLock { $0 = ["/api/doc/"] }
+        func asked() -> [String] { HeldServer.hits.withLock { $0 }.filter { $0.hasSuffix("/history") } }
+        // every row comes on screen, some twice (a scroll back)
+        for id in ids + ids.prefix(3) { m.wantEditMeta(id) }
+        for _ in 0..<200 where asked().count < 4 { try await Task.sleep(for: .milliseconds(10)) }
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(asked().count == 4, "four at a time: \(asked().count)")
+        // a doc being fetched is not asked again, from a row or the doc's screen
+        m.wantEditMeta("lib0")
+        #expect(asked().contains("/api/doc/lib0/history"), "the first four go first")
+        let screen = Task { await m.loadEditMeta("lib0") }
+        let row0 = m.editedTimes.entry("lib0")
+        HeldServer.held.withLock { $0 = [] }
+        await screen.value
+        for _ in 0..<300 where m.editMeta.count < 10 { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(m.editMeta.count == 10)
+        #expect(asked().sorted() == ids.map { "/api/doc/\($0)/history" }.sorted(), "one request per doc")
+        #expect(row0.date == Date(timeIntervalSince1970: Double(0x0199a0b0c0d0) / 1000), "the row's time arrived")
+        // known: a row coming back asks nothing
+        m.wantEditMeta("lib1")
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(asked().count == 10)
     }
 }

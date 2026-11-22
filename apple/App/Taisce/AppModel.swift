@@ -89,7 +89,19 @@ final class AppModel {
 
     // local state
     private(set) var pins: [DocID] = []
-    var editMeta: [DocID: EditMeta] = [:]
+    var editMeta: [DocID: EditMeta] = [:] { didSet { editedTimes.follow(editMeta) } }
+    /// the Library rows' edited times, one observable per doc
+    @ObservationIgnored let editedTimes = EditedTimes()
+    /// edit metadata being fetched, and rows waiting for the next batch
+    @ObservationIgnored private var metaInFlight: Set<DocID> = []
+    @ObservationIgnored private var metaWanted: [DocID] = []
+    @ObservationIgnored private var metaBatch: Task<Void, Never>?
+    /// bumped when the metadata is forgotten (sign-out, another server): a
+    /// batch still out then lands nothing
+    @ObservationIgnored private var metaGeneration = 0
+    /// rows coming on screen within this gather into one batch
+    @ObservationIgnored var metaBatchDelay: Duration = .milliseconds(150)
+    static let metaConcurrency = 4
     /// docs whose "edited by" is due again (a sync touched them): the old
     /// one shows until the new one arrives, so the header never jumps
     private(set) var staleMeta: Set<DocID> = []
@@ -341,7 +353,7 @@ final class AppModel {
         storedWorkspace = nil
         workspaces = []
         workspacesSupported = false
-        editMeta = [:]
+        resetEditMeta()
         codeRuns.reset()
         sqlRuns.reset()
         shareLinks.reset()
@@ -506,7 +518,7 @@ final class AppModel {
             dueAlerts.connect(cache: cache, replay: { [weak self] in await self?.replayOutbox() }, sync: sync)
             pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
             await loadCachedWorkspaces(cache) // workspaces
-            editMeta = [:]
+            resetEditMeta()
             shareLinks.reset()
             home.reset()
             treeLoaded = false
@@ -749,12 +761,80 @@ final class AppModel {
     }
 
     /// Who last edited the doc, from its ledger; cached until the doc changes.
+    /// One request per doc at a time: a doc already being fetched is left to
+    /// that fetch.
     func loadEditMeta(_ id: DocID) async {
-        guard editMeta[id] == nil || staleMeta.contains(id), let api else { return }
-        if let history = try? await api.docHistory(id), let meta = EditMeta(history: history) {
+        guard needsEditMeta(id), let api else { return }
+        metaInFlight.insert(id)
+        let asked = metaGeneration
+        let history = try? await api.docHistory(id)
+        guard asked == metaGeneration else { return }
+        metaInFlight.remove(id)
+        if let history, let meta = EditMeta(history: history) {
             editMeta[id] = meta
         }
         staleMeta.remove(id)
+    }
+
+    private func resetEditMeta() {
+        metaGeneration += 1
+        metaBatch?.cancel()
+        metaBatch = nil
+        metaWanted = []
+        metaInFlight = []
+        editMeta = [:]
+    }
+
+    private func needsEditMeta(_ id: DocID) -> Bool {
+        (editMeta[id] == nil || staleMeta.contains(id)) && !metaInFlight.contains(id)
+    }
+
+    /// A Library row came on screen: its edited time is wanted. Rows
+    /// arriving together (opening the Library, a scroll) gather for
+    /// `metaBatchDelay`, then go out at most `metaConcurrency` at a time,
+    /// and land in `editMeta` together, one change per batch, not one per
+    /// reply.
+    func wantEditMeta(_ id: DocID) {
+        guard needsEditMeta(id), !metaWanted.contains(id) else { return }
+        metaWanted.append(id)
+        guard metaBatch == nil else { return }
+        metaBatch = Task { [weak self] in
+            guard let delay = self?.metaBatchDelay else { return }
+            try? await Task.sleep(for: delay)
+            await self?.loadWantedMeta()
+        }
+    }
+
+    private func loadWantedMeta() async {
+        let asked = metaGeneration
+        defer { if asked == metaGeneration { metaBatch = nil } }
+        while !metaWanted.isEmpty, !Task.isCancelled {
+            let ids = metaWanted.filter(needsEditMeta)
+            metaWanted = []
+            guard let api, !ids.isEmpty else { return }
+            metaInFlight.formUnion(ids)
+            let found = await withTaskGroup(of: (DocID, EditMeta?).self) { group in
+                var out: [(DocID, EditMeta?)] = []
+                var next = ids.makeIterator()
+                for _ in 0..<Self.metaConcurrency {
+                    guard let id = next.next() else { break }
+                    group.addTask { (id, (try? await api.docHistory(id)).flatMap(EditMeta.init(history:))) }
+                }
+                while let r = await group.next() {
+                    out.append(r)
+                    if let id = next.next() {
+                        group.addTask { (id, (try? await api.docHistory(id)).flatMap(EditMeta.init(history:))) }
+                    }
+                }
+                return out
+            }
+            guard asked == metaGeneration else { return }
+            metaInFlight.subtract(ids)
+            var meta = editMeta
+            for case let (id, m?) in found { meta[id] = m }
+            if meta != editMeta { editMeta = meta }
+            if !staleMeta.isDisjoint(with: ids) { staleMeta.subtract(ids) }
+        }
     }
 
     /// A sync touched these docs (our own save's echo included): their

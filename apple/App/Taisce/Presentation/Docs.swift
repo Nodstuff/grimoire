@@ -199,19 +199,48 @@ enum RelativeTime {
         let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day ?? 0
         if days == 1 { return "yesterday" }
         if days < 7 { return "\(days) d ago" }
-        let f = DateFormatter()
-        f.calendar = calendar
-        f.timeZone = calendar.timeZone
-        f.setLocalizedDateFormatFromTemplate(calendar.isDate(date, equalTo: now, toGranularity: .year) ? "d MMM" : "d MMM yyyy")
-        return f.string(from: date)
+        let template = calendar.isDate(date, equalTo: now, toGranularity: .year) ? "d MMM" : "d MMM yyyy"
+        return DateFormats.formatter(template, calendar: calendar, locale: nil).string(from: date)
     }
 
     /// "Wednesday 1 October"
     static func dayLine(_ date: Date = .now, calendar: Calendar = .current) -> String {
+        DateFormats.formatter("EEEE d MMMM", calendar: calendar, locale: nil).string(from: date).replacingOccurrences(of: ",", with: "")
+    }
+}
+
+/// Date formatters made once per template, calendar, time zone and locale,
+/// not per call: making one is slow (ICU), and the Library asked for one
+/// per row per redraw, Today for one per draw. Formatting with a shared
+/// formatter is thread-safe; one is never changed after it is made.
+enum DateFormats {
+    /// the formatters, behind a lock (DateFormatter formats safely from any thread)
+    private final class Store: @unchecked Sendable {
+        let lock = NSLock()
+        var made: [String: DateFormatter] = [:]
+    }
+    private static let store = Store()
+
+    /// `locale` nil: the formatter's default (the current locale), as a
+    /// fresh `DateFormatter` has.
+    static func formatter(_ template: String, calendar: Calendar, locale: Locale?) -> DateFormatter {
+        let key = [template, "\(calendar.identifier)", calendar.timeZone.identifier, locale?.identifier ?? "-", Locale.current.identifier].joined(separator: "|")
+        store.lock.lock()
+        defer { store.lock.unlock() }
+        if let f = store.made[key] { return f }
         let f = DateFormatter()
         f.calendar = calendar
         f.timeZone = calendar.timeZone
-        f.setLocalizedDateFormatFromTemplate("EEEE d MMMM")
-        return f.string(from: date).replacingOccurrences(of: ",", with: "")
+        if let locale { f.locale = locale }
+        f.setLocalizedDateFormatFromTemplate(template)
+        store.made[key] = f
+        return f
+    }
+
+    /// how many are kept (tests)
+    static var count: Int {
+        store.lock.lock()
+        defer { store.lock.unlock() }
+        return store.made.count
     }
 }

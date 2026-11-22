@@ -17,13 +17,13 @@ struct LibraryScreen: View {
             header: LibraryHeaderModel.make(model),
             emptyState: model.workspaceEmptyState,
             flags: model.reviewCounts.counts,
-            edited: { model.editMeta[$0]?.date },
+            edited: { model.editedTimes.entry($0) },
             onTogglePin: model.togglePin,
             // a workspace you only view takes no new docs (ADR 0004)
             onNewDoc: model.currentAccess.canCreate ? { router.newDoc(in: $0) } : nil,
             onNewFolder: model.currentAccess.canCreate ? { router.newFolder(in: $0) } : nil,
             onOpen: { router.open(.doc($0)) },
-            onRowAppear: { id in Task { await model.loadEditMeta(id) } },
+            onRowAppear: { model.wantEditMeta($0) },
             reveal: router.revealDoc,
             onRevealed: { router.revealDoc = nil }
         )
@@ -87,8 +87,8 @@ struct LibraryContent: View {
     var emptyState: WorkspaceEmptyState?
     /// open review items per doc (the row's flag pill)
     var flags: [DocID: Int] = [:]
-    /// when a doc was last edited, if known
-    var edited: (DocID) -> Date? = { _ in nil }
+    /// when a doc was last edited, if known (read by each row)
+    var edited: (DocID) -> EditedTime? = { _ in nil }
     var onTogglePin: (DocID) -> Void = { _ in }
     /// nil parent = top level
     var onNewDoc: ((DocID?) -> Void)?
