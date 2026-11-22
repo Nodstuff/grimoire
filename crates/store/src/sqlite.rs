@@ -2499,24 +2499,34 @@ impl BlockStore for SqliteStore {
         if kind == GardenerKind::Reviewer {
             return Err(StoreError::InvalidOp("the reviewer gardener kind was retired".into()));
         }
-        // each gardener is its own principal: provenance is per-gardener
-        let principal = self.create_principal(PrincipalKind::Agent, name, None)?;
+        self.deny_public()?;
         if let Some(d) = scope_doc {
             self.see(d)?;
         }
         let id = Uuid::now_v7();
         // a gardener works for someone: the creating user, else (the admin
         // CLI) the instance owner
-        self.deny_public()?;
         let owner = match self.scope.user() {
             Some(u) => Some(u),
             None => self.instance_owner()?,
         };
-        self.conn.execute(
-            "UPDATE principals SET owner_user = ?1 WHERE id = ?2",
-            params![owner.map(|o| o.to_string()), principal.id.to_string()],
-        )?;
-        self.conn.execute(
+        // each gardener is its own principal (provenance is per-gardener),
+        // created with the gardener in one transaction: a refused gardener
+        // (a taken name) leaves no orphan principal behind (code review
+        // 2026-11-22, item 19)
+        let principal = crate::Principal {
+            id: Uuid::now_v7(),
+            kind: PrincipalKind::Agent,
+            display_name: name.into(),
+            pubkey: None,
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO principals (id, kind, display_name, pubkey, owner_user, name_key) VALUES (?1, 'agent', ?2, NULL, ?3, NULL)",
+            params![principal.id.to_string(), name, owner.map(|o| o.to_string())],
+        )
+        .map_err(tenancy::name_conflict)?;
+        tx.execute(
             "INSERT INTO gardeners (id, name, kind, principal, scope_doc, task_prompt, confidence_policy, owner_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -2530,6 +2540,7 @@ impl BlockStore for SqliteStore {
                 owner.map(|o| o.to_string()),
             ],
         )?;
+        tx.commit()?;
         Ok(Gardener {
             id,
             name: name.into(),
@@ -4988,6 +4999,20 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// A gardener that cannot be created (its name is taken) leaves no
+    /// principal behind: the two rows commit together.
+    #[test]
+    fn a_refused_gardener_leaves_no_orphan_principal() {
+        use crate::{BlockStore, ConfidencePolicy, GardenerKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let g = s.create_gardener("tags", GardenerKind::Tagging, "t", None, ConfidencePolicy::Review).unwrap();
+        assert_eq!(s.get_principal(g.principal).unwrap().display_name, "tags");
+        assert!(s.create_gardener("tags", GardenerKind::Tagging, "t", None, ConfidencePolicy::Review).is_err());
+        let n: i64 = s.conn.query_row("SELECT count(*) FROM principals WHERE display_name = 'tags'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "no orphan principal");
+        assert_eq!(s.list_gardeners().unwrap().len(), 1);
     }
 
     /// Resolving a block op takes no every-user access snapshot (it cannot
