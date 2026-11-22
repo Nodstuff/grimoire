@@ -14,3 +14,16 @@ export function afterSave({ editedMeanwhile, mounted }: { editedMeanwhile: boole
   if (!editedMeanwhile) return 'clean'
   return mounted ? 'rearm' : 'save-now'
 }
+
+/** The idempotency key a save sends (`request_id` on /api/propose): the same
+ * request — same doc, base and ops, i.e. a retry — keeps its key, so if an
+ * earlier attempt landed but its answer was lost the daemon answers with
+ * that outcome instead of applying the ops twice. Anything else gets a new
+ * one. */
+export interface PendingRequest {
+  body: string
+  id: string
+}
+export function requestFor(prev: PendingRequest | null, body: string, mint: () => string = () => crypto.randomUUID()): PendingRequest {
+  return prev && prev.body === body ? prev : { body, id: mint() }
+}

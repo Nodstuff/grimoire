@@ -71,12 +71,13 @@ impl StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Blocks the editor never sees. Mirrors the UI's block-list filter
-/// (`ui/src/App.tsx`, the `editable.blocks` walk): comments and canvas scenes are not
-/// content flow, and anything starting with `---` (frontmatter, horizontal
-/// rules) is never seeded into the editor. A markdown diff taken against the
-/// editor's view (`mddiff::markdown_to_ops_editor`) must therefore skip these
-/// or it would delete what the editor merely could not show.
+/// Blocks a markdown diff taken against an editor's view
+/// (`mddiff::markdown_to_ops_editor`) leaves alone: comments and canvas
+/// scenes are not content flow, and anything starting with `---`. The web
+/// editor (`ui/src/editor/splitTree.ts`) hides only closed YAML frontmatter
+/// (`import::is_frontmatter`) and shows a lone `---` as a horizontal rule;
+/// skipping rules here too is the safe side, since a block this diff skips
+/// is never deleted by it.
 pub fn is_editor_hidden(b: &Block) -> bool {
     matches!(b.block_type, BlockType::Comment | BlockType::CanvasScene)
         || b.content.starts_with("---")

@@ -89,10 +89,18 @@ export function keyForPosition(siblings: { sort_key: string | null }[], index: n
   return keyBetween(lo, hi)
 }
 
+/** Frontmatter: a `---` line, then a closing `---` line. A lone `---` is a
+ * horizontal rule. Mirrors crates/store/src/import.rs `is_frontmatter`. */
+export function isFrontmatter(content: string): boolean {
+  const lines = content.split('\n').map((l) => l.replace(/\r$/, ''))
+  return lines[0] === '---' && lines.slice(1).some((l) => l === '---')
+}
+
 export function inferBlockType(content: string): string {
   if (content.startsWith('```mermaid')) return 'diagram_mermaid'
   if (content.startsWith('```d2')) return 'diagram_d2'
-  if (content.startsWith('```') || content.startsWith('---')) return 'code'
+  // a rule (`---`) is a paragraph, as the store types it
+  if (content.startsWith('```') || isFrontmatter(content)) return 'code'
   if (/^#{1,6} /.test(content)) return 'heading'
   if (content.startsWith('DECISION:')) return 'decision'
   return 'paragraph'
