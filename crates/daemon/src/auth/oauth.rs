@@ -729,8 +729,12 @@ async fn code_grant(
     if !pkce_verifier_ok(verifier) || pkce_s256(verifier) != c.code_challenge {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");
     }
+    // the code is already spent: storing the CIMD client is best effort.
+    // A grant without its client row still works (the principal comes from
+    // the client_id's host; a later authorize fetches the document again),
+    // where failing here would cost the person their sign-in
     if let Err(e) = persist_cimd_client(st, client_id).await {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e);
+        tracing::warn!(target: AUDIT, event = "client.cimd_store_failed", client = client_id, error = e, ip);
     }
     let grant = Grant {
         id: uuid::Uuid::now_v7(),

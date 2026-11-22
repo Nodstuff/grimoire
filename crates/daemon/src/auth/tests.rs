@@ -774,6 +774,42 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     assert!(h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().is_some(), "a signed-in client is never pruned");
 }
 
+/// Review of this branch, item 3: the code is consumed before the CIMD
+/// client is stored, so a store-side failure there must not cost the person
+/// their sign-in. Here the document stops answering after /authorize and the
+/// held copy is gone: the exchange still issues tokens.
+#[tokio::test]
+async fn a_cimd_client_that_cannot_be_stored_still_gets_its_tokens() {
+    let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
+    cfg.cimd_allow_insecure = true;
+    let mut h = harness_with(cfg);
+    assert!(h.enroll().await.status.is_success());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let id = format!("http://{}/client.json", listener.local_addr().unwrap());
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (doc, on) = (json!({"client_id": id, "client_name": "Flaky", "redirect_uris": [REDIRECT]}).to_string(), served.clone());
+    let app = Router::new().route(
+        "/client.json",
+        axum::routing::get(move || {
+            let (doc, on) = (doc.clone(), on.clone());
+            async move {
+                if on.load(std::sync::atomic::Ordering::SeqCst) { (StatusCode::OK, doc) } else { (StatusCode::SERVICE_UNAVAILABLE, String::new()) }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let q = format!("response_type=code&client_id={id}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256");
+    let (r, req) = h.authorize(&q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let redirect = h.sign_in(&req.unwrap()).await;
+    let code = Url::parse(&redirect).unwrap().query_pairs().find(|(k, _)| k == "code").unwrap().1.into_owned();
+    served.store(false, std::sync::atomic::Ordering::SeqCst);
+    *h.st.cimd.lock().unwrap() = crate::auth::oauth::CimdMemory::default();
+    let r = h.exchange(&id, &code, VERIFIER).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.json()["access_token"].is_string());
+}
+
 /// Code review 2026-11-22, item 2: DCR is unauthenticated, so registrations
 /// nobody signs in with are capped (the oldest make room) and swept after a
 /// day; a client someone signed in with is never removed.
