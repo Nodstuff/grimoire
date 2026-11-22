@@ -3418,20 +3418,19 @@ fn resolve_doc_op(
         | (AnnotationKind::Parked, ReviewDecision::Decline) => Ok(None),
         (AnnotationKind::Review, ReviewDecision::Decline) => {
             let inverse = inverse_of(&op.kind, None)?;
-            // the way back is a move like any other: authorized as the
-            // reviewer's own (space change, writable parent), exactly as the
-            // accept path checks a parked move. If it can no longer be made
-            // (the old parent went somewhere the reviewer cannot write), the
-            // decline is superseded: the doc stays (code review 2026-11-22,
-            // item 13)
-            if let OpKind::MoveDoc { new_parent, .. } = &inverse {
-                match check_move(tx, scope, doc_id, *new_parent) {
-                    Ok(_) => {}
-                    Err(StoreError::Forbidden(_) | StoreError::NotFound(_)) => {
-                        return Ok(Some(ApplyReceipt { doc_id, epoch: current, op_ids: vec![] }));
-                    }
-                    Err(e) => return Err(e),
-                }
+            // the way back undoes the agent's move; it is not a new move by
+            // the reviewer, so it is not authorized as one. It is honoured
+            // while the old place is still valid FOR THE DOC'S OWNER: the old
+            // parent is live (and not now under the doc), and the space the
+            // doc would land in is one its owner can write. Otherwise (the
+            // old parent is gone, or went somewhere the owner cannot write)
+            // the decline is superseded and the doc stays: content never
+            // lands with people its owner did not put it with (code review
+            // 2026-11-22, item 13, and its review)
+            if let OpKind::MoveDoc { new_parent, .. } = &inverse
+                && !undo_move_still_valid(tx, scope, doc_id, *new_parent)?
+            {
+                return Ok(Some(ApplyReceipt { doc_id, epoch: current, op_ids: vec![] }));
             }
             project_doc_op(tx, doc_id, &inverse)?;
             let mut note = String::new();
@@ -3491,6 +3490,44 @@ fn resolve_doc_op(
             }))
         }
     }
+}
+
+/// May a declined agent move be undone, putting `doc` back under
+/// `old_parent` (None: the root)? The old parent must be live and not now
+/// inside `doc` (a cycle), and the space `doc` would land in (its own label,
+/// else the old parent's space, else at the root its owner's Unsorted) must
+/// be one the doc's owner (`docs.owner_id`, else the instance owner) can
+/// write. System/Local skip the space check (one person).
+fn undo_move_still_valid(conn: &Connection, scope: Scope, doc: Uuid, old_parent: Option<Uuid>) -> Result<bool> {
+    if let Some(p) = old_parent {
+        if !doc_is_live(conn, p)? {
+            return Ok(false);
+        }
+        let mut cursor = Some(p);
+        while let Some(c) = cursor {
+            if c == doc {
+                return Ok(false);
+            }
+            cursor = doc_parent_of(conn, c)?;
+        }
+    }
+    if scope.sees_all() {
+        return Ok(true);
+    }
+    let own: Option<String> = conn.query_row("SELECT owner_id FROM docs WHERE id = ?1", params![doc.to_string()], |r| r.get(0))?;
+    let owner = match own.map(|o| uuid_col(o, "docs.owner_id")).transpose()? {
+        Some(o) => Some(o),
+        None => tenancy::instance_owner_conn(conn)?,
+    };
+    let Some(owner) = owner else { return Ok(false) };
+    let to = match crate::workspaces::label_conn(conn, doc)? {
+        Some(w) => tenancy::Space::Workspace(w),
+        None => match old_parent {
+            Some(p) => tenancy::space_conn(conn, p)?,
+            None => tenancy::Space::Unsorted(Some(owner)),
+        },
+    };
+    Ok(tenancy::access_conn(conn, Scope::User(owner), to)?.is_some_and(|r| r.can_write()))
 }
 
 fn get_doc_conn(conn: &Connection, id: Uuid) -> Result<Doc> {

@@ -1261,3 +1261,41 @@ fn the_share_gates_writes_are_all_or_nothing() {
     let (made, _) = s.create_doc_with_ops("Made", Some(t.shared_doc), t.agent, vec![para("body")]).unwrap();
     assert_eq!(s.review_queue(Some(made.id)).unwrap().len(), 1);
 }
+
+/// Review of the fix branch (item 13 follow-up): a member's decline of an
+/// agent's move is honoured whenever the old place is still valid for the
+/// doc's owner, even if the decliner cannot see the old parent. A's doc D,
+/// filed into Family under A's private X, is moved within Family by A's
+/// agent; B (a Family editor) declines: D goes back under X, still in Family,
+/// and B never sees X.
+#[test]
+fn a_members_decline_of_an_agent_move_restores_the_owners_place() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let (x, d) = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let x = s.create_doc("A's private X", None, t.a_human).unwrap().id;
+        let d = s.create_doc("Filed D", Some(x), t.a_human).unwrap().id;
+        s.set_doc_workspace(d, Some(t.family), t.a_human).unwrap();
+        let out = s
+            .propose_doc_op(d, t.agent, OpKind::MoveDoc {
+                new_parent: Some(t.shared_doc),
+                sort_key: None,
+                new_parent_title: None,
+                from_parent: None,
+                from_sort_key: None,
+                from_parent_title: None,
+            }, vec![])
+            .unwrap();
+        assert_eq!(out.verdicts[0].verdict, Verdict::Yellow, "within Family: flagged, applied");
+        (x, d)
+    };
+    let ann = t.store.lock(Scope::User(t.b)).review_queue(Some(d)).unwrap().pop().unwrap().annotation.id;
+    let receipt = t.store.lock(Scope::User(t.b)).resolve(ann, t.b_human, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(!receipt.op_ids.is_empty(), "reverted, not superseded");
+    let a = t.store.lock(Scope::User(t.a));
+    assert_eq!(a.get_doc(d).unwrap().parent_id, Some(x), "back under X");
+    assert_eq!(a.doc_workspace(d).unwrap(), Some(t.family), "still in Family");
+    drop(a);
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(x));
+}
