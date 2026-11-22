@@ -658,6 +658,12 @@ final class AppModel {
         repeat {
             replayAgain = false
             guard let api, let cache, mayReplay else { break }
+            // replay is single-flight and this is the app's only replayer, so
+            // a row in flight now is an orphan: a replay cancelled with the
+            // poll task (backgrounding) whose settle never landed. Left, it
+            // stays stuck until the cache reopens and later writes (an untick
+            // after its tick) overtake it. Released even from a cancelled task.
+            _ = try? await Task { try await cache.releaseInflight() }.value
             guard let round = try? await OutboxReplayer(api: api, cache: cache).replay() else { continue }
             var sum = report ?? OutboxReplayer.Report()
             sum.forbidden += round.forbidden

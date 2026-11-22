@@ -119,6 +119,27 @@ final class HeldServer: URLProtocol {
         try await cache.wipe()
     }
 
+    /// Review of 28dc9cf: a row a cancelled replay left in flight (the poll
+    /// task cancelled on backgrounding; the cache is not reopened on return)
+    /// goes out at the next replay, before the writes queued after it.
+    @Test func aRowLeftInFlightByACancelledReplayGoesFirstNextReplay() async throws {
+        URLProtocol.registerClass(HeldServer.self)
+        defer { URLProtocol.unregisterClass(HeldServer.self) }
+        HeldServer.reset()
+        defer { HeldServer.reset() }
+        let m = try await HeldServer.model()
+        let cache = try #require(m.cache)
+        let clock = TodoClock(today: "2026-10-01", utcOffset: "+00:00")
+        let tick = try await cache.enqueueTodoToggle(date: "2026-10-01", itemID: "0-a", done: true, clock: clock)
+        // what a cancelled replay whose settle never landed leaves behind
+        #expect(try await cache.claimOutbox(try #require(tick.id))?.state == .inflight)
+        let untick = try await cache.enqueueTodoToggle(date: "2026-10-01", itemID: "0-a", done: false, clock: clock)
+        await m.replayOutbox()
+        #expect(HeldServer.requestIDs == [tick.idempotencyKey, untick.idempotencyKey], "the tick first, then the untick")
+        #expect(try await cache.pendingOutbox().isEmpty)
+        try await cache.wipe()
+    }
+
     /// Review 2026-11-22 #4: Today's review queue and the person's name
     /// answer after a sign-out are the previous account's: dropped.
     @Test func homeAnswersAfterASignOutAreDropped() async throws {

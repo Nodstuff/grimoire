@@ -94,4 +94,22 @@ import Testing
         #expect(try await cache.pendingOutbox().isEmpty)
         #expect(try await cache.releaseInflight() == 0)
     }
+
+    /// Review of 28dc9cf: a replay cancelled mid-send (sync stops when the
+    /// app leaves the front) still settles its row: back in the queue, not
+    /// stuck in flight where no later replay would take it.
+    @Test func aCancelledReplaySettlesItsRowInsteadOfLeavingItInFlight() async throws {
+        let cache = try Cache.inMemory()
+        let row = try await cache.enqueueTodoToggle(date: "2026-10-01", itemID: "0-a", done: true, clock: Self.clock)
+        let server = MockServer { _ in MockServer.Reply(chunks: [], hold: true) }
+        let replay = Task { try await OutboxReplayer(api: server.client(), cache: cache).replay() }
+        for _ in 0..<500 where server.requests.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(server.requests.count == 1)
+        replay.cancel()
+        _ = try? await replay.value
+        let id = try #require(row.id)
+        let after = try #require(try await cache.outboxEntry(id))
+        #expect(after.state == .pending, "left \(after.state)")
+        #expect(try await cache.releaseInflight() == 0)
+    }
 }

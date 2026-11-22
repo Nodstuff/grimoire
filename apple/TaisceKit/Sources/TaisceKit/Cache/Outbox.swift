@@ -454,24 +454,27 @@ public struct OutboxReplayer: Sendable {
                     if let body = Self.withRequestID(entry) { r.httpBody = body }
                     let data = try await api.send(raw: r)
                     let isPropose = entry.path == "/api/propose" || entry.path == "/api/propose_markdown"
-                    try await cache.markOutbox(id, state: .done, outcome: isPropose ? data : nil)
-                    // whole-doc proposes (no per-block bases) rebase only onto our
-                    // own write: an epoch that jumped further means someone else wrote
-                    if entry.path == "/api/propose_markdown", let (doc, base) = Self.proposeBase(entry),
-                       let outcome = try? JSONDecoder().decode(Landed.self, from: data), outcome.epoch == base + 1 {
-                        try await cache.rebaseOutbox(docID: doc, from: base, to: outcome.epoch)
+                    let cache = cache
+                    try await Self.uncancelled {
+                        try await cache.markOutbox(id, state: .done, outcome: isPropose ? data : nil)
+                        // whole-doc proposes (no per-block bases) rebase only onto our
+                        // own write: an epoch that jumped further means someone else wrote
+                        if entry.path == "/api/propose_markdown", let (doc, base) = Self.proposeBase(entry),
+                           let outcome = try? JSONDecoder().decode(Landed.self, from: data), outcome.epoch == base + 1 {
+                            try await cache.rebaseOutbox(docID: doc, from: base, to: outcome.epoch)
+                        }
                     }
                 } catch let APIError.server(msg) where msg.hasPrefix(Self.liveSessionRefusal) {
                     // a live session freezes the doc's epoch: retry after it ends
-                    try await cache.markOutbox(id, state: .pending, error: msg)
+                    try await settle(id, state: .pending, error: msg)
                     return report
                 } catch APIError.unauthorized {
                     // signed out or mid-refresh: not this entry's fault, keep it and the order
-                    try await cache.markOutbox(id, state: .pending, error: String(describing: APIError.unauthorized))
+                    try await settle(id, state: .pending, error: String(describing: APIError.unauthorized))
                     return report
                 } catch let e as APIError where e.isTransient {
                     // 5xx, 408, 429, or a proxy's HTML page: try again later, keep order
-                    try await cache.markOutbox(id, state: .pending, error: String(describing: e))
+                    try await settle(id, state: .pending, error: String(describing: e))
                     return report
                 } catch let e as APIError where move != nil {
                     // the server refused a move (a cycle, no write access on the
@@ -481,33 +484,49 @@ public struct OutboxReplayer: Sendable {
                 } catch let e as APIError where Cache.moveLabelRole(of: entry) == .label {
                     // a move's label: failed, so the move after it is held back
                     // (and settles both); not a viewer's write to report
-                    try await cache.markOutbox(id, state: .failed, error: Self.moveRefusal(e))
+                    try await settle(id, state: .failed, error: Self.moveRefusal(e))
                 } catch let e as APIError where Cache.moveLabelRole(of: entry) == .undo {
                     // undoing a refused move's label: nothing left to send
-                    try await cache.markOutbox(id, state: .done, error: Self.moveRefusal(e))
+                    try await settle(id, state: .done, error: Self.moveRefusal(e))
                 } catch let e as APIError where e.isForbidden {
                     // ADR 0004: read-only here (a viewer, or the role changed
                     // under us). Never retried on its own; the rest carry on.
-                    try await cache.markOutbox(id, state: .failed, error: Self.readOnlyMessage)
+                    try await settle(id, state: .failed, error: Self.readOnlyMessage)
                     report.forbidden += 1
                 } catch APIError.notFound {
                     // the doc is gone (hard-deleted elsewhere): kept as failed, so
                     // the text stays where refused writes are shown and can be
                     // copied out. Only a `revoked` row drops writes (dropOutbox).
-                    try await cache.markOutbox(id, state: .failed, error: Self.goneMessage)
+                    try await settle(id, state: .failed, error: Self.goneMessage)
                     report.gone += 1
                 } catch let e as APIError {
                     // the server answered: retrying the same request won't help
-                    try await cache.markOutbox(id, state: .failed, error: String(describing: e))
+                    try await settle(id, state: .failed, error: String(describing: e))
                 } catch {
                     // transport failure: leave it for the next replay, keep order
-                    try await cache.markOutbox(id, state: .pending, error: String(describing: error))
+                    try await settle(id, state: .pending, error: String(describing: error))
                     return report
                 }
             }
             if !followUp { break }
         }
         return report
+    }
+
+    /// Settle a claimed row. It must land even when the replay's task was
+    /// cancelled meanwhile (sync stops when the app leaves the front, and
+    /// GRDB refuses a write from a cancelled task): a row left in flight is
+    /// never claimed again until the next replay releases it, and a write
+    /// the server took but never marked done would go out again.
+    func settle(_ id: Int64, state: OutboxEntry.State, error: String? = nil, outcome: Data? = nil) async throws {
+        let cache = cache
+        try await Self.uncancelled { try await cache.markOutbox(id, state: state, error: error, outcome: outcome) }
+    }
+
+    /// Run `work` to its end whatever the caller's cancellation (an
+    /// unstructured task does not inherit it); the caller still waits.
+    static func uncancelled(_ work: @escaping @Sendable () async throws -> Void) async throws {
+        try await Task { try await work() }.value
     }
 
     /// A to-do write's body with the row's key as `request_id`, so a

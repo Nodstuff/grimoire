@@ -324,7 +324,7 @@ extension OutboxReplayer {
     /// Returns whether a follow-up write was queued.
     func refuseMove(_ entry: OutboxEntry, _ move: QueuedDocMove, message: String, report: inout Report) async throws -> Bool {
         guard let id = entry.id else { return false }
-        try await cache.markOutbox(id, state: .done, error: message)
+        try await settle(id, state: .done, error: message)
         var undo = false
         if let label = try await cache.outboxEntry(key: Cache.labelKey(forMove: entry.idempotencyKey)), let lid = label.id {
             switch label.state {
