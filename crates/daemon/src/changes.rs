@@ -207,6 +207,7 @@ fn change_stream(feed: &Feed, store: SharedStore, scope: Scope, after: i64) -> i
 async fn changes_stream(
     State(st): State<ApiState>,
     v: Viewer,
+    who: Option<axum::Extension<crate::auth::Authenticated>>,
     headers: HeaderMap,
     q: Result<Query<StreamQuery>, QueryRejection>,
 ) -> Response {
@@ -220,7 +221,8 @@ async fn changes_stream(
         return error(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     let after = resume_from(&headers, q.since);
-    Sse::new(change_stream(&st.changes, st.store.clone(), v.scope, after))
+    let stream = change_stream(&st.changes, st.store.clone(), v.scope, after);
+    Sse::new(crate::auth::until_revoked(stream, st.store.clone(), who.map(|w| w.0), crate::auth::STREAM_RECHECK))
         .keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping"))
         .into_response()
 }

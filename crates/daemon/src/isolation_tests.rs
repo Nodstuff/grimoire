@@ -3923,6 +3923,7 @@ async fn agent_fabric_work_is_its_owners_alone() {
         "/api/fabric/attention",
         "/api/fabric/orders",
         "/api/fabric/turns?since=0",
+        "/api/fabric/turns?since_seq=0",
         "/api/fabric/settings",
         "/api/fabric/fabrics",
         "/api/fabric/projects",
@@ -3932,10 +3933,18 @@ async fn agent_fabric_work_is_its_owners_alone() {
         assert_eq!(st, StatusCode::OK, "{path}: {out}");
         blank(path, &out);
     }
+    // A's order id is no cursor into anything of hers
+    let path = format!("/api/fabric/orders?before=9999999999&before_id={a_order}");
+    let (st, out) = fx.b("GET", &path, None).await;
+    assert_eq!(st, StatusCode::OK, "{path}: {out}");
+    blank(&path, &out);
     // A's things by id: not found, never forbidden
     for path in [
         format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns"),
         format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?after=0"),
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?after=0&after_id=t1"),
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?after_seq=0"),
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?before=9999999999&before_id=t1"),
         format!("/api/fabric/orders/{a_order}"),
         format!("/api/fabric/pairing/{a_pairing}"),
         format!("/api/fabric/conversations/{a_conv}"),
@@ -4013,4 +4022,103 @@ async fn agent_fabric_work_is_its_owners_alone() {
         let (st, _) = fx.call(&fx.b_pat, method, path, Some(json!({}))).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "PAT {method} {path}");
     }
+}
+
+/// Code review 2026-11-22, item 1: an agent cannot accept its own parked
+/// proposal by switching its `as` label between `doc_op` and `resolve`. The
+/// exact bypass: B's PAT trashes B's own doc as `claude:a` (red, parked),
+/// then accepts it as `claude:b` — refused, and the doc is still there. A
+/// yellow (a rename) is refused the same way: both labels are the token's.
+/// B's own app, a person, still accepts.
+#[tokio::test]
+async fn an_agent_cannot_accept_its_own_parked_delete_by_switching_labels() {
+    let fx = fixture();
+    let (is_err, out) = fx
+        .tool(&fx.b_pat, "doc_op", json!({"op": "delete", "doc_id": fx.b_doc.to_string(), "as": "claude:a"}))
+        .await;
+    assert!(!is_err && out.starts_with("parked"), "{out}");
+    let red = fx.store.lock(Scope::User(fx.b)).review_queue(Some(fx.b_doc)).unwrap().last().unwrap().annotation.id;
+    for token in [&fx.b_pat, &fx.b_conn] {
+        let (is_err, out) =
+            fx.tool(token, "resolve", json!({"annotation_id": red.to_string(), "decision": "accept", "as": "claude:b"})).await;
+        assert!(is_err, "an agent accepted a red: {out}");
+        assert!(!fx.store.lock(Scope::User(fx.b)).doc_is_tombstoned(fx.b_doc).unwrap(), "the doc must survive");
+    }
+    // a yellow by the token is not the token's to accept under another label
+    let (is_err, out) = fx
+        .tool(&fx.b_pat, "doc_op", json!({"op": "rename", "doc_id": fx.b_doc.to_string(), "title": "Renamed", "as": "claude:a"}))
+        .await;
+    assert!(!is_err && out.contains("yellow"), "{out}");
+    let yellow = fx.store.lock(Scope::User(fx.b)).review_queue(Some(fx.b_doc)).unwrap().into_iter()
+        .find(|e| e.annotation.kind == taisce_store::AnnotationKind::Review).unwrap().annotation.id;
+    let (is_err, out) =
+        fx.tool(&fx.b_pat, "resolve", json!({"annotation_id": yellow.to_string(), "decision": "accept", "as": "claude:b"})).await;
+    assert!(is_err && out.contains("own"), "{out}");
+    // a decline weakens nothing (it reverts the rename), so another label
+    // of the token may still withdraw it
+    let (is_err, out) =
+        fx.tool(&fx.b_pat, "resolve", json!({"annotation_id": yellow.to_string(), "decision": "decline", "as": "claude:b"})).await;
+    assert!(!is_err, "{out}");
+    assert_eq!(fx.store.lock(Scope::User(fx.b)).get_doc(fx.b_doc).unwrap().title, "Aoife work");
+    // a person accepts the red: the doc is trashed
+    let (st, out) = fx.b("POST", "/api/resolve", Some(json!({"annotation_id": red, "decision": "accept"}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert!(fx.store.lock(Scope::User(fx.b)).doc_is_tombstoned(fx.b_doc).unwrap());
+}
+
+/// Code review 2026-11-22, item 7: a connector cannot write as the person's
+/// PAT principal (`claude:claude-code`), nor the PAT as the connector's
+/// (`claude:claude`). Each still writes as its own base and as a fresh label.
+#[tokio::test]
+async fn a_connector_cannot_write_as_a_pats_principal_nor_vice_versa() {
+    let fx = fixture();
+    let append = |label: &str| json!({"doc_id": fx.b_doc.to_string(), "markdown": "label probe", "as": label});
+    let (is_err, out) = fx.tool(&fx.b_conn, "append", append("claude:claude-code")).await;
+    assert!(is_err && out.contains("personal access token"), "{out}");
+    let (is_err, out) = fx.tool(&fx.b_pat, "append", append("claude:claude")).await;
+    assert!(is_err && out.contains("OAuth client"), "{out}");
+    for (token, label) in [(&fx.b_conn, "claude:claude"), (&fx.b_pat, "claude:claude-code"), (&fx.b_conn, "claude:fresh")] {
+        let (is_err, out) = fx.tool(token, "append", append(label)).await;
+        assert!(!is_err, "{label}: {out}");
+    }
+}
+
+/// Code review 2026-11-22, item 3: a live stream ends once the grant it was
+/// opened with is revoked (re-checked every `STREAM_RECHECK`, 200 ms under
+/// test), on both the change feed and the fleet stream. A stream whose
+/// grant stays live keeps going.
+#[tokio::test]
+async fn a_stream_ends_once_its_grant_is_revoked() {
+    use futures_util::StreamExt;
+    let fx = fixture();
+    let open = |path: &'static str, token: String| {
+        let app = fx.app.clone();
+        async move {
+            let req = authed(Request::get(path).header("host", "localhost:7513"), &token, "GET").body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            res.into_body().into_data_stream()
+        }
+    };
+    // drains a body until it ends (true) or `wait` passes (false)
+    async fn ends_within(mut body: axum::body::BodyDataStream, wait: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, body.next()).await {
+                Ok(None) => return true,
+                Ok(Some(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+    let changes = open("/api/changes/stream?since=0", fx.b_app.clone()).await;
+    let fleet = open("/api/fabric/stream", fx.b_app.clone()).await;
+    // A's streams: her grant is untouched
+    let a_changes = open("/api/changes/stream?since=0", fx.a_app.clone()).await;
+    let revoked = fx.store.lock(Scope::System).oauth_revoke_by_token(&hash_secret(&fx.b_app), "test", now()).unwrap();
+    assert!(revoked.is_some());
+    let wait = std::time::Duration::from_secs(3);
+    assert!(ends_within(changes, wait).await, "the change feed outlived the revoke");
+    assert!(ends_within(fleet, wait).await, "the fleet stream outlived the revoke");
+    assert!(!ends_within(a_changes, std::time::Duration::from_millis(800)).await, "a live grant's stream keeps going");
 }

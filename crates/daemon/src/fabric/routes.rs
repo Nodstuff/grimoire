@@ -251,7 +251,12 @@ fn fleet_stream(
         .chain(stream::unfold(watcher, next_change))
 }
 
-async fn fleet_events(State(st): State<FabricState>, v: Viewer, headers: HeaderMap) -> Response {
+async fn fleet_events(
+    State(st): State<FabricState>,
+    v: Viewer,
+    who: Option<axum::Extension<crate::auth::Authenticated>>,
+    headers: HeaderMap,
+) -> Response {
     let (hub, user) = match gate(&st, &v, &headers) {
         Ok(g) => g,
         Err(r) => return r.into_response(),
@@ -260,7 +265,8 @@ async fn fleet_events(State(st): State<FabricState>, v: Viewer, headers: HeaderM
     // empty stream
     match hub.watch(user).await {
         Ok((fleet, rx)) => {
-            Sse::new(fleet_stream(fleet, rx)).keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping")).into_response()
+            let stream = crate::auth::until_revoked(fleet_stream(fleet, rx), hub.0.store.clone(), who.map(|w| w.0), crate::auth::STREAM_RECHECK);
+            Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping")).into_response()
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -339,7 +345,20 @@ async fn unfollow(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, 
 #[derive(serde::Deserialize)]
 struct Page {
     before: Option<i64>,
+    /// With `before`: the turn_id (orders: the order id) of the oldest row
+    /// held, which ended (was created) at `before`. The page is then the
+    /// rows strictly older than that row, so same-second rows are not
+    /// skipped. Without it, `before` alone is `ended < before`, as ever.
+    before_id: Option<String>,
     after: Option<i64>,
+    /// With `after`: the turn_id of the newest turn held (ended at `after`).
+    after_id: Option<String>,
+    /// Turns: the highest `seq` held. The page is the turns stored after it,
+    /// in the order they were stored, a replayed turn whose `ended` is in
+    /// the past included. Alone (not with before/after).
+    after_seq: Option<i64>,
+    /// `/api/fabric/turns`: the same, across the fleet (instead of `since`).
+    since_seq: Option<i64>,
     since: Option<i64>,
     limit: Option<usize>,
     runtime_id: Option<Uuid>,
@@ -359,11 +378,22 @@ async fn session_turns(
     if before.is_some() && after.is_some() {
         return error(StatusCode::BAD_REQUEST, "before or after, not both");
     }
+    if (q.before_id.is_some() && before.is_none()) || (q.after_id.is_some() && after.is_none()) {
+        return error(StatusCode::BAD_REQUEST, "before_id needs before, after_id needs after");
+    }
+    if q.after_seq.is_some() && (before.is_some() || after.is_some()) {
+        return error(StatusCode::BAD_REQUEST, "after_seq stands alone");
+    }
+    let (before_id, after_id, after_seq) = (q.before_id, q.after_id, q.after_seq);
     // `after`: the turns ended since, oldest first (a client topping up what
-    // it holds); otherwise the newest page, newest first
-    let read = move |s: &mut taisce_store::SqliteStore| match after {
-        Some(after) => s.fabric_turns_after(runtime, session, after, limit + 1),
-        None => s.fabric_turns(runtime, session, before, limit + 1),
+    // it holds); otherwise the newest page, newest first. With `_id` the
+    // cursor is that exact turn (ADR 0008), so same-second turns survive.
+    let read = move |s: &mut taisce_store::SqliteStore| match (after, after_id, before, before_id) {
+        _ if after_seq.is_some() => s.fabric_turns_after_seq(runtime, session, after_seq.unwrap_or(0), limit + 1),
+        (Some(after), Some(id), _, _) => s.fabric_turns_after_id(runtime, session, after, &id, limit + 1),
+        (Some(after), None, _, _) => s.fabric_turns_after(runtime, session, after, limit + 1),
+        (None, _, Some(before), Some(id)) => s.fabric_turns_before(runtime, session, before, &id, limit + 1),
+        (None, _, before, _) => s.fabric_turns(runtime, session, before, limit + 1),
     };
     match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(mut turns) => {
@@ -378,7 +408,15 @@ async fn session_turns(
 async fn turns_since(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, Query(q): Query<Page>) -> Response {
     let (hub, user) = gated!(st, v, headers);
     let (since, limit) = (q.since.unwrap_or(0), q.limit.unwrap_or(100).clamp(1, 200));
-    match with_store(&hub.0.store, Scope::User(user), move |s| s.fabric_turns_since(since, limit)).await {
+    if q.since.is_some() && q.since_seq.is_some() {
+        return error(StatusCode::BAD_REQUEST, "since or since_seq, not both");
+    }
+    let since_seq = q.since_seq;
+    let read = move |s: &mut taisce_store::SqliteStore| match since_seq {
+        Some(seq) => s.fabric_turns_since_seq(seq, limit),
+        None => s.fabric_turns_since(since, limit),
+    };
+    match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(turns) => Json(json!({"turns": turns.iter().map(TurnView::from).collect::<Vec<_>>()})).into_response(),
         Err(e) => store_error(e),
     }
@@ -416,7 +454,14 @@ async fn submit_order(State(st): State<FabricState>, v: Viewer, headers: HeaderM
 async fn orders(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, Query(q): Query<Page>) -> Response {
     let (hub, user) = gated!(st, v, headers);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    match with_store(&hub.0.store, Scope::User(user), move |s| s.fabric_orders(q.runtime_id, q.session_id, q.before, limit)).await {
+    if q.before_id.is_some() && q.before.is_none() {
+        return error(StatusCode::BAD_REQUEST, "before_id needs before");
+    }
+    let read = move |s: &mut taisce_store::SqliteStore| match (q.before, q.before_id.as_deref()) {
+        (Some(before), Some(id)) => s.fabric_orders_before(q.runtime_id, q.session_id, before, id, limit),
+        (before, _) => s.fabric_orders(q.runtime_id, q.session_id, before, limit),
+    };
+    match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(orders) => Json(json!({"orders": orders.iter().map(OrderView::from).collect::<Vec<_>>()})).into_response(),
         Err(e) => store_error(e),
     }

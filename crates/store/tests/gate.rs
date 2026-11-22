@@ -233,6 +233,26 @@ fn proposer_cannot_resolve_own_proposal() {
     assert_eq!(f.s.review_queue(None).unwrap().len(), 1, "still open");
 }
 
+/// Code review 2026-11-22, item 1: a red is parked until a PERSON accepts.
+/// Another agent principal (an `as` label switch is exactly this) cannot
+/// apply it; it may still decline (close) it, and a human still accepts.
+#[test]
+fn no_agent_accepts_a_parked_red_but_a_human_can() {
+    let mut f = fixture();
+    tom_edits(&mut f);
+    // stale replace of a block Tom changed → red, parked
+    let out = f.s.propose(f.doc.id, 1, f.agent.id, vec![replace(f.para, "agent edit")]).unwrap();
+    assert_eq!(out.verdicts[0].verdict, Verdict::Red);
+    let ann = f.s.review_queue(None).unwrap()[0].annotation.id;
+    let other = f.s.create_principal(PrincipalKind::Agent, "claude:b", None).unwrap();
+    let err = f.s.resolve(ann, other.id, ReviewDecision::Accept);
+    assert!(matches!(err, Err(StoreError::InvalidOp(ref m)) if m.contains("person")), "{err:?}");
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "tom's edit", "nothing applied");
+    assert_eq!(f.s.review_queue(None).unwrap().len(), 1, "still open");
+    f.s.resolve(ann, f.tom.id, ReviewDecision::Accept).unwrap();
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "agent edit");
+}
+
 /// The invariant bounds AGENTS. The human owner's own stale edit that the
 /// gate parked red (an autosave racing a second window) must be
 /// resolvable by that human — otherwise it is stuck in the queue forever.

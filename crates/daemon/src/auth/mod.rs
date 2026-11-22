@@ -133,6 +133,8 @@ pub struct AuthState {
     pub webauthn: Arc<webauthn_rs::Webauthn>,
     pub pending: Arc<Mutex<passkey::Pending>>,
     pub limiter: ratelimit::Limiter,
+    /// CIMD documents not yet behind a grant (`oauth::CimdMemory`).
+    pub cimd: Arc<Mutex<oauth::CimdMemory>>,
 }
 
 impl AuthState {
@@ -150,6 +152,7 @@ impl AuthState {
             webauthn: Arc::new(webauthn),
             pending: Arc::new(Mutex::new(passkey::Pending::default())),
             limiter: ratelimit::Limiter::default(),
+            cimd: Arc::new(Mutex::new(oauth::CimdMemory::default())),
         })
     }
 }
@@ -453,6 +456,59 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
         })
     })
     .await
+}
+
+impl Authenticated {
+    /// The credential behind this identity, by id.
+    pub fn credential(&self) -> taisce_store::auth::Credential {
+        use taisce_store::auth::Credential;
+        if self.web_session {
+            Credential::WebSession(self.grant_id)
+        } else if self.book_upload {
+            Credential::UploadToken(self.grant_id)
+        } else if self.client_id.starts_with("pat:") {
+            Credential::ApiToken(self.grant_id)
+        } else {
+            Credential::Grant(self.grant_id)
+        }
+    }
+}
+
+/// How often a long-lived stream (`/api/changes/stream`,
+/// `/api/fabric/stream`) re-checks that its credential is still live.
+pub const STREAM_RECHECK: std::time::Duration =
+    if cfg!(test) { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(30) };
+
+/// End `stream` once `who`'s grant, token or web session is revoked (or its
+/// user removed), checked every `every`. A stream opened before a revoke
+/// otherwise kept delivering for as long as the connection held (code
+/// review 2026-11-22, item 3). LOCAL mode (`who` None): never ends here.
+pub fn until_revoked<S>(
+    stream: S,
+    store: SharedStore,
+    who: Option<Authenticated>,
+    every: std::time::Duration,
+) -> impl futures_util::Stream<Item = S::Item> + use<S>
+where
+    S: futures_util::Stream,
+{
+    use futures_util::StreamExt as _;
+    let revoked = async move {
+        let Some(who) = who else { return std::future::pending::<()>().await };
+        let cred = who.credential();
+        loop {
+            tokio::time::sleep(every).await;
+            let live = crate::store_ext::with_store(&store, Scope::System, move |s| s.auth_credential_live(cred, now()))
+                .await
+                // a store that cannot answer is not a revoke: check again
+                .unwrap_or(true);
+            if !live {
+                tracing::info!(target: AUDIT, event = "stream.ended_revoked", user = %who.user_id, client = who.client_id);
+                return;
+            }
+        }
+    };
+    stream.take_until(Box::pin(revoked))
 }
 
 /// Resolve a personal access token to its owner, with the identity an OAuth

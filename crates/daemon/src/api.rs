@@ -660,32 +660,52 @@ async fn d2_binary() -> Option<&'static str> {
     Some(*FOUND.get_or_init(|| probed))
 }
 
+/// At most this many d2 renders at once, each killed after `D2_TIMEOUT`
+/// (waiting for a slot included): a pathological diagram cannot pile up
+/// processes or hold a request forever (code review 2026-11-22, item 8).
+const D2_CONCURRENCY: usize = 2;
+const D2_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+static D2_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(D2_CONCURRENCY);
+
 async fn render_d2(Json(req): Json<D2Req>) -> Json<Value> {
     let Some(bin) = d2_binary().await else {
         return Json(json!({"error": "d2 binary not installed (brew install d2)"}));
     };
-    let out = tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let mut child = std::process::Command::new(bin)
-            .args(["--theme", "200", "-", "-"])
+    Json(render_with(&D2_SLOTS, bin, &["--theme", "200", "-", "-"], req.source, D2_TIMEOUT).await)
+}
+
+/// Run `bin args` with `source` on stdin under a slot of `slots`, the whole
+/// of it (the wait for a slot too) bounded by `limit`; past it the child is
+/// killed (`kill_on_drop`). `{"svg"}` on success, else `{"error"}`.
+async fn render_with(slots: &tokio::sync::Semaphore, bin: &str, args: &[&str], source: String, limit: std::time::Duration) -> Value {
+    let run = async {
+        let _slot = slots.acquire().await.map_err(|_| "d2 render failed".to_string())?;
+        let mut child = tokio::process::Command::new(bin)
+            .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(req.source.as_bytes())?;
-        child.wait_with_output()
-    })
-    .await;
-    match out {
-        Ok(Ok(o)) if o.status.success() => Json(json!({"svg": String::from_utf8_lossy(&o.stdout)})),
-        Ok(Ok(o)) => Json(
-            json!({"error": String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>()}),
-        ),
-        _ => Json(json!({"error": "d2 render failed"})),
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| "d2 render failed".to_string())?;
+        // written beside the wait, so a large diagram cannot deadlock on a
+        // full stdout pipe
+        let mut stdin = child.stdin.take();
+        let write = async move {
+            if let Some(i) = stdin.as_mut() {
+                use tokio::io::AsyncWriteExt;
+                let _ = i.write_all(source.as_bytes()).await;
+            }
+            drop(stdin);
+        };
+        let (_, out) = tokio::join!(write, child.wait_with_output());
+        out.map_err(|_| "d2 render failed".to_string())
+    };
+    match tokio::time::timeout(limit, run).await {
+        Ok(Ok(o)) if o.status.success() => json!({"svg": String::from_utf8_lossy(&o.stdout)}),
+        Ok(Ok(o)) => json!({"error": String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>()}),
+        Ok(Err(e)) => json!({"error": e}),
+        Err(_) => json!({"error": format!("d2 render timed out after {}s", limit.as_secs())}),
     }
 }
 
@@ -1782,5 +1802,34 @@ mod http_client_tests {
         let b = call(&app, "POST", "/api/propose_markdown", &[], Some(body)).await;
         assert_eq!(a, b);
         assert_eq!(a["epoch"], 3, "{a}");
+    }
+
+    /// Code review 2026-11-22, item 8: a render that never finishes is
+    /// killed at the limit, and renders past the slot count wait for one
+    /// (within the same limit) instead of piling up processes.
+    #[tokio::test]
+    async fn a_render_is_killed_at_its_limit_and_slots_cap_concurrency() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let slots = tokio::sync::Semaphore::new(1);
+        let out = super::render_with(&slots, "/bin/sleep", &["30"], String::new(), ms(300)).await;
+        assert!(out["error"].as_str().unwrap().contains("timed out"), "{out}");
+        assert!(t0.elapsed() < ms(5000), "killed, not waited out");
+        assert_eq!(slots.available_permits(), 1, "the slot came back");
+        // one slot held by a long render: a second times out waiting for it
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = {
+            let slots = slots.clone();
+            tokio::spawn(async move { super::render_with(&slots, "/bin/sleep", &["2"], String::new(), ms(5000)).await })
+        };
+        tokio::time::sleep(ms(100)).await;
+        let t1 = std::time::Instant::now();
+        let second = super::render_with(&slots, "/bin/cat", &[], "x".into(), ms(300)).await;
+        assert!(second["error"].as_str().unwrap().contains("timed out"), "{second}");
+        assert!(t1.elapsed() < ms(1500));
+        // the first finishes normally; with the slot free, the next one runs
+        assert!(held.await.unwrap()["svg"].is_string());
+        let ok = super::render_with(&slots, "/bin/cat", &[], "<svg/>".into(), ms(2000)).await;
+        assert_eq!(ok["svg"], "<svg/>");
     }
 }

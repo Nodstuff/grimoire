@@ -12,6 +12,7 @@ import { api } from '../types'
 import { appTheme, renderReladraw } from './reladraw'
 import { DIAGRAM_LANGS } from './diagramLangs'
 import { loadMermaid } from './mermaidLoader'
+import { safeSvg } from './svgSafe'
 import { Icon, useTheme } from '../lapis'
 import { copyText } from '../Profile'
 import { notify } from '../Notice'
@@ -54,8 +55,14 @@ let mermaidSeq = 0
 
 /** A diagram fence drawn to SVG: mermaid and reladraw here, d2 by the
  *  daemon. Throws what the renderer said. Also draws the diagrams of docs
- *  that are not on screen (a share link's sub-pages, share.ts). */
+ *  that are not on screen (a share link's sub-pages, share.ts). The SVG is
+ *  sanitised (safeSvg): it is drawn from doc text, links included, and goes
+ *  into the page as markup. */
 export async function drawDiagram(lang: string, code: string, dark: boolean): Promise<string> {
+  return safeSvg(await drawRaw(lang, code, dark))
+}
+
+async function drawRaw(lang: string, code: string, dark: boolean): Promise<string> {
   if (lang === 'mermaid') {
     const mermaid = await loadMermaid()
     mermaid.initialize(mermaidConfig(dark))

@@ -90,6 +90,22 @@ CREATE TRIGGER IF NOT EXISTS docs_rev_ad AFTER DELETE ON docs BEGIN
     UPDATE doc_revs SET rev = rev + 1 WHERE id = 1;
 END;
 
+-- v19: the same counter per doc, for a per-user change stamp (doc_revs is
+-- global: another person's edit must not move yours). Any UPDATE of a docs
+-- row counts, so a same-length rename or a review-policy change is seen
+-- (code review 2026-11-22, item 17). A doc never updated has no row (0).
+CREATE TABLE IF NOT EXISTS doc_row_revs (
+    doc_id TEXT PRIMARY KEY,
+    rev    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS doc_row_revs_au AFTER UPDATE ON docs BEGIN
+    INSERT OR IGNORE INTO doc_row_revs (doc_id) VALUES (new.id);
+    UPDATE doc_row_revs SET rev = rev + 1 WHERE doc_id = new.id;
+END;
+CREATE TRIGGER IF NOT EXISTS doc_row_revs_ad AFTER DELETE ON docs BEGIN
+    DELETE FROM doc_row_revs WHERE doc_id = old.id;
+END;
+
 CREATE TABLE IF NOT EXISTS ops (
     id            TEXT PRIMARY KEY,
     doc_id        TEXT NOT NULL REFERENCES docs (id),

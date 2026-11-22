@@ -112,6 +112,12 @@
 //!   workspace_id, epoch}]` lists what was read, and `doc_id`/`epoch` stay
 //!   the legacy list's.
 //! - `POST /api/todo/note {date, item_id, note, today}` (empty clears)
+//!
+//! Every write above (`POST`) also takes an optional `request_id` (a UUID,
+//! fresh per action): a retry of that write with the same `request_id`, on
+//! the same route, by the same person, within 7 days (restarts included),
+//! is not applied again and answers the day as it stands with
+//! `replayed: true`. Without one, every call applies (as before).
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
@@ -848,6 +854,12 @@ struct ClientClock {
     /// `unsorted`, a workspace id or name; absent = the legacy list
     #[serde(default)]
     workspace: Option<String>,
+    /// Writes only: an optional idempotency key (any UUID, fresh per
+    /// action). A retry of the same write with the same `request_id` (within
+    /// 7 days, across restarts) is not applied again: it answers the day as
+    /// it stands now, with `replayed: true`. Keyed per person and per route.
+    #[serde(default)]
+    request_id: Option<Uuid>,
 }
 
 /// The client's date and zone, validated. `today` is required in SERVER mode
@@ -1013,11 +1025,14 @@ fn check_date(d: &str) -> Result<(), String> {
 
 /// Shared write shape: read the doc's markdown, transform (given today's
 /// date for phrase resolution), save, answer with the day plus any phrase
-/// warning.
+/// warning. With a `request_id` already answered for this person and
+/// `route`, nothing is written: the day as it stands, `replayed: true`
+/// (code review 2026-11-22, item 20: an app retry must not add twice).
 async fn mutate(
     st: ApiState,
     v: Viewer,
     server: bool,
+    route: &'static str,
     clock: ClientClock,
     date: String,
     f: impl FnOnce(&str, &str, Option<FixedOffset>) -> Result<Written, String> + Send + 'static,
@@ -1030,6 +1045,9 @@ async fn mutate(
         Err(m) => return Json(json!({"error": m})),
     };
     let human = v.human;
+    // per route: the same key on another route is another write
+    let key = clock.request_id.map(|rid| crate::mcp::dedupe_key(route, None, &json!(rid)));
+    let dedupe = st.dedupe.clone();
     with_store(&st.store, v.scope, move |s| {
         let scope = match scope_of(s, clock.workspace.as_deref()) {
             Ok(sc) => sc,
@@ -1039,6 +1057,17 @@ async fn mutate(
             Ok(d) => d,
             Err(e) => return crate::api::api_err(&e),
         };
+        if let Some(key) = key
+            && crate::mcp::durable_get(s, &dedupe, human, key, crate::mcp::REQUEST_ID_TTL).is_some()
+        {
+            return match day_json(s, &doc, &date, &today, 0, None) {
+                Ok(mut v) => {
+                    v["replayed"] = json!(true);
+                    Json(v)
+                }
+                Err(e) => Json(json!({"error": e})),
+            };
+        }
         let md = match taisce_store::export::export_doc(&*s, doc.id) {
             Ok(m) => m,
             Err(e) => return crate::api::api_err(&e),
@@ -1049,6 +1078,11 @@ async fn mutate(
         };
         if let Err(e) = save(s, doc.id, human, &new_md) {
             return Json(json!({"error": e}));
+        }
+        // applied: a retry with this key must not apply it again (recorded
+        // even if the answer below fails to render)
+        if let Some(key) = key {
+            crate::mcp::durable_put(s, &dedupe, human, key, json!({"applied": true}), crate::mcp::REQUEST_ID_TTL);
         }
         match day_json(s, &doc, &date, &today, 0, warning) {
             Ok(v) => Json(v),
@@ -1123,7 +1157,7 @@ struct AddReq {
 
 async fn add(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<AddReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, zone| add_item(md, &date, today, zone, &req.text)).await
+    mutate(st, v, server.is_some(), "todo/add", req.clock, req.date, move |md, today, zone| add_item(md, &date, today, zone, &req.text)).await
 }
 
 #[derive(Deserialize)]
@@ -1270,7 +1304,7 @@ struct ToggleReq {
 
 async fn toggle(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<ToggleReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| {
+    mutate(st, v, server.is_some(), "todo/toggle", req.clock, req.date, move |md, today, _| {
         toggle_item(md, &date, today, req.item_id.as_deref(), req.text.as_deref(), req.done).map(|m| (m, None))
     })
     .await
@@ -1287,7 +1321,7 @@ struct EditReq {
 
 async fn edit(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<EditReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, zone| {
+    mutate(st, v, server.is_some(), "todo/edit", req.clock, req.date, move |md, today, zone| {
         edit_item(md, &date, today, zone, &req.item_id, &req.text)
     })
     .await
@@ -1303,7 +1337,7 @@ struct RemoveReq {
 
 async fn remove(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<RemoveReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| remove_item(md, &date, today, &req.item_id).map(|m| (m, None))).await
+    mutate(st, v, server.is_some(), "todo/remove", req.clock, req.date, move |md, today, _| remove_item(md, &date, today, &req.item_id).map(|m| (m, None))).await
 }
 
 #[derive(Deserialize)]
@@ -1317,7 +1351,7 @@ struct MoveReq {
 
 async fn mv(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<MoveReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| move_item(md, &date, today, &req.item_id, &req.to_date).map(|m| (m, None))).await
+    mutate(st, v, server.is_some(), "todo/move", req.clock, req.date, move |md, today, _| move_item(md, &date, today, &req.item_id, &req.to_date).map(|m| (m, None))).await
 }
 
 #[derive(Deserialize)]
@@ -1332,7 +1366,7 @@ struct ReorderReq {
 
 async fn reorder(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<ReorderReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| {
+    mutate(st, v, server.is_some(), "todo/reorder", req.clock, req.date, move |md, today, _| {
         reorder_item(md, &date, today, &req.item_id, req.before.as_deref()).map(|m| (m, None))
     })
     .await
@@ -1354,7 +1388,7 @@ struct DeadlineReq {
 
 async fn deadline(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<DeadlineReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| {
+    mutate(st, v, server.is_some(), "todo/deadline", req.clock, req.date, move |md, today, _| {
         let blank = |x: &Option<String>| x.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
         let (dl, at) = (blank(&req.deadline), blank(&req.due_at));
         set_deadline(md, &date, today, &req.item_id, dl.as_deref(), at.as_deref()).map(|m| (m, None))
@@ -1374,7 +1408,7 @@ struct NoteReq {
 
 async fn note(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<NoteReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| set_note(md, &date, today, &req.item_id, &req.note).map(|m| (m, None))).await
+    mutate(st, v, server.is_some(), "todo/note", req.clock, req.date, move |md, today, _| set_note(md, &date, today, &req.item_id, &req.note).map(|m| (m, None))).await
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -1661,6 +1695,40 @@ mod tests {
         assert!(should_carry(DOC, "2026-09-11", T));
         assert!(!should_carry(DOC, "2026-09-09", T), "reading yesterday");
         assert!(!should_carry(DOC, "2026-09-09", "2026-09-09"), "today but a newer day exists");
+    }
+
+    /// Code review 2026-11-22, item 20: an app retry with the same
+    /// `request_id` adds (or toggles) once; another id, or none, applies.
+    #[tokio::test]
+    async fn a_retried_write_with_its_request_id_applies_once() {
+        use crate::home::testing::{app, call};
+        let (app, _) = app();
+        let d = "2026-09-09";
+        let rid = Uuid::now_v7();
+        let body = json!({"date": d, "text": "buy milk", "today": d, "request_id": rid});
+        let first = call(&app, "POST", "/api/todo", Some(body.clone())).await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 1, "{first}");
+        assert!(first.get("replayed").is_none());
+        let again = call(&app, "POST", "/api/todo", Some(body)).await;
+        assert_eq!(again["items"].as_array().unwrap().len(), 1, "a retry adds nothing: {again}");
+        assert_eq!(again["replayed"], true);
+        // a toggle retried after the person toggled back is not re-applied
+        let id = first["items"][0]["id"].as_str().unwrap().to_string();
+        let trid = Uuid::now_v7();
+        let toggle = json!({"date": d, "item_id": id, "done": true, "today": d, "request_id": trid});
+        assert_eq!(call(&app, "POST", "/api/todo/toggle", Some(toggle.clone())).await["items"][0]["done"], true);
+        call(&app, "POST", "/api/todo/toggle", Some(json!({"date": d, "item_id": id, "done": false, "today": d}))).await;
+        let retried = call(&app, "POST", "/api/todo/toggle", Some(toggle)).await;
+        assert_eq!((retried["items"][0]["done"].as_bool(), retried["replayed"].as_bool()), (Some(false), Some(true)), "{retried}");
+        // the same key on another route is another write
+        let other = call(&app, "POST", "/api/todo/note", Some(json!({"date": d, "item_id": id, "note": "2%", "today": d, "request_id": rid}))).await;
+        assert!(other.get("replayed").is_none(), "{other}");
+        assert_eq!(other["items"][0]["note"], "2%");
+        // a fresh id, or none, applies
+        let b = call(&app, "POST", "/api/todo", Some(json!({"date": d, "text": "buy milk", "today": d, "request_id": Uuid::now_v7()}))).await;
+        assert_eq!(b["items"].as_array().unwrap().len(), 2);
+        let c = call(&app, "POST", "/api/todo", Some(json!({"date": d, "text": "buy milk", "today": d}))).await;
+        assert_eq!(c["items"].as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]

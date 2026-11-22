@@ -556,3 +556,20 @@ async fn a_snooze_racing_a_wake_leaves_the_store_and_the_fleet_agreeing() {
         assert_eq!(held, t.stored(id).unwrap().quiet_until, "round {round}");
     }
 }
+
+/// Code review 2026-11-22, item 9: a sync in progress for one person no
+/// longer holds up another person's fleet read; the same person's still
+/// waits (the per-fleet invariant the lock exists for).
+#[tokio::test]
+async fn one_persons_sync_does_not_wait_on_anothers() {
+    let t = setup();
+    let other = t.store.lock(Scope::System).auth_add_user("ann", 1).unwrap().id;
+    let held = t.hub.sync_lock(t.user);
+    let _busy = held.lock().await;
+    let wait = std::time::Duration::from_secs(2);
+    assert!(tokio::time::timeout(wait, t.hub.fleet(other)).await.is_ok(), "ann's read waited on tom's sync");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), t.hub.fleet(t.user)).await.is_err(),
+        "tom's own reads still wait for his sync"
+    );
+}

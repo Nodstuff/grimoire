@@ -10,6 +10,7 @@ import { buildSnapshot, buildTreeSnapshot, createShare, isLive, listShares, rend
 import { api, type Doc } from './types'
 import { Button, useTheme } from './lapis'
 import { drawDiagram } from './editor/CodeBlockView'
+import { flushDoc } from './editor/registry'
 
 const EXPIRY: { label: string; days: number | null }[] = [
   { label: '1 day', days: 1 },
@@ -45,6 +46,12 @@ export default function SharePanel({ docId, title }: { docId: string; title: str
   const create = async () => {
     setBusy(true)
     try {
+      // the snapshot is the server's markdown: unsaved typing (the autosave
+      // waits 1.2 s) lands first, or the link would leave it out
+      if (!(await flushDoc(docId))) {
+        notify('not shared yet: an edit has not saved, and the link would leave it out — try again once it saves', 'warn')
+        return
+      }
       const { markdown } = await api<{ markdown: string }>(`/api/doc/${docId}/markdown`)
       let snapshot = buildSnapshot(title, markdown, renderedDiagrams())
       let problems: string[] = []

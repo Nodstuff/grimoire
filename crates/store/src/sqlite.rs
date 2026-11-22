@@ -91,7 +91,10 @@ impl SqliteStore {
         ] {
             add_column_if_missing(&conn, "fabric_sessions", col, decl)?;
         }
+        // v17: the turns' insertion sequence (fabric.sql)
+        add_column_if_missing(&conn, "fabric_turns", "seq", "INTEGER")?;
         backfill(&conn)?;
+        sequence_turns(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
 
@@ -521,7 +524,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 19;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -596,7 +599,52 @@ fn backfill(conn: &Connection) -> Result<()> {
     // for ADR 0008 the turns, attention, orders, settings, projects,
     // pairings, conversations and messages tables). Created IF NOT EXISTS
     // by init, the later columns added when missing; nothing to backfill.
+    if version < 17 {
+        // v17: Agent Fabric turns get an insertion sequence (the column is
+        // added by init when missing): the rows already held are numbered
+        // in the order they were stored, and the column is indexed
+        tx.execute_batch(
+            "UPDATE fabric_turns SET seq = rowid WHERE seq IS NULL;
+             CREATE INDEX IF NOT EXISTS fabric_turns_seq ON fabric_turns (seq);",
+        )?;
+    }
+    // v19: per-doc update counters (schema.sql: doc_row_revs and its
+    // triggers, created IF NOT EXISTS by init). Nothing to backfill: a doc
+    // with no row counts 0 until its next update.
+    if version < 18 {
+        // v18: ops by target block. `block_readable` (behind `mask_anchor`,
+        // on every comment read_doc returns) and the e-reader tagger look a
+        // block's ops up by `target_block`, which scanned the whole ledger
+        // (code review 2026-11-22, item 15)
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS ops_by_target ON ops (target_block);")?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Every open: lift the turn counter past every stored `seq`, and number
+/// the turns stored without one (by a binary from before v17, after a
+/// rollback) in the order they were stored. Cheap when there are none (the
+/// seq index finds NULLs).
+fn sequence_turns(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE fabric_turn_seq SET next = MAX(next, (SELECT COALESCE(MAX(seq), 0) + 1 FROM fabric_turns)) WHERE id = 1",
+        [],
+    )?;
+    let bare: Vec<i64> = {
+        let mut st = tx.prepare("SELECT rowid FROM fabric_turns WHERE seq IS NULL ORDER BY rowid")?;
+        st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    if !bare.is_empty() {
+        let mut next: i64 = tx.query_row("SELECT next FROM fabric_turn_seq WHERE id = 1", [], |r| r.get(0))?;
+        for rowid in bare {
+            tx.execute("UPDATE fabric_turns SET seq = ?1 WHERE rowid = ?2", params![next, rowid])?;
+            next += 1;
+        }
+        tx.execute("UPDATE fabric_turn_seq SET next = ?1 WHERE id = 1", [next])?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1785,18 +1833,22 @@ impl BlockStore for SqliteStore {
                 }
                 None => false,
             };
+        // the new doc has no policy of its own: it inherits its parent's
+        let policy = match (gated, parent) {
+            (true, Some(p)) => self.effective_policy(p)?,
+            _ => crate::DEFAULT_REVIEW_POLICY,
+        };
+        // the doc row and its content commit together, gated or not: a
+        // gated batch that fails leaves no empty doc behind (code review
+        // 2026-11-22, item 14)
         let tx = self.conn.transaction()?;
         insert_doc_row(&tx, id, title, parent, created_by, owner)?;
-        let ops = if n > 0 && !gated {
-            apply_in_tx(&tx, id, 0, created_by, ops)?;
-            Vec::new()
-        } else {
-            ops
-        };
-        tx.commit()?;
         if gated {
-            self.propose_impl(id, 0, created_by, ops, true)?;
+            propose_in_tx(&tx, id, 0, created_by, ops, true, true, policy)?;
+        } else if n > 0 {
+            apply_in_tx(&tx, id, 0, created_by, ops)?;
         }
+        tx.commit()?;
         Ok((self.get_doc(id)?, n))
     }
 
@@ -1892,10 +1944,18 @@ impl BlockStore for SqliteStore {
             if base_epoch != current {
                 return Err(StoreError::StaleBase { base: base_epoch, current });
             }
-            let out = self.propose_impl(doc_id, base_epoch, principal, ops, true)?;
+            check_propose_ops(&ops)?;
+            let policy = self.effective_policy(doc_id)?;
+            // all or nothing, like an ungated apply: an op that would not
+            // apply refuses the whole batch and nothing is written (it used
+            // to commit the rest and then answer the error; code review
+            // 2026-11-22, item 14)
+            let tx = self.conn.transaction()?;
+            let out = propose_in_tx(&tx, doc_id, base_epoch, principal, ops, true, true, policy)?;
             if let Some(v) = out.verdicts.iter().find(|v| !v.applied) {
                 return Err(StoreError::InvalidOp(format!("apply: {}", v.note)));
             }
+            tx.commit()?;
             return Ok(ApplyReceipt {
                 doc_id,
                 epoch: out.epoch,
@@ -2061,7 +2121,11 @@ impl BlockStore for SqliteStore {
             )?;
         }
         // a parent that is itself still in the trash would hide the restored
-        // doc again: surface it at the root instead
+        // doc again: surface it at the root instead, in the space it was in.
+        // Unlabelled at the root it would fall to its owner_id's Unsorted:
+        // out of a shared workspace, possibly to someone no longer a member
+        // (code review 2026-11-22, item 12). A doc that was in a workspace
+        // keeps it, at the workspace's top level.
         if let Some(p) = parent {
             let parent_deleted: i64 = tx.query_row(
                 "SELECT coalesce((SELECT deleted FROM docs WHERE id = ?1), 1)",
@@ -2069,10 +2133,20 @@ impl BlockStore for SqliteStore {
                 |r| r.get(0),
             )?;
             if parent_deleted == 1 {
+                let was = tenancy::space_conn(&tx, doc_id)?;
                 tx.execute(
                     "UPDATE docs SET parent_id = NULL WHERE id = ?1",
                     params![doc_id.to_string()],
                 )?;
+                if let tenancy::Space::Workspace(w) = was
+                    && crate::workspaces::label_conn(&tx, doc_id)?.is_none()
+                {
+                    tx.execute(
+                        "INSERT INTO doc_workspace (doc_id, workspace_id) VALUES (?1, ?2)",
+                        params![doc_id.to_string(), w.to_string()],
+                    )?;
+                }
+                debug_assert_eq!(tenancy::space_conn(&tx, doc_id).ok(), Some(was));
             }
         }
         tenancy::journal_access_diff(&tx, before)?;
@@ -2452,24 +2526,34 @@ impl BlockStore for SqliteStore {
         if kind == GardenerKind::Reviewer {
             return Err(StoreError::InvalidOp("the reviewer gardener kind was retired".into()));
         }
-        // each gardener is its own principal: provenance is per-gardener
-        let principal = self.create_principal(PrincipalKind::Agent, name, None)?;
+        self.deny_public()?;
         if let Some(d) = scope_doc {
             self.see(d)?;
         }
         let id = Uuid::now_v7();
         // a gardener works for someone: the creating user, else (the admin
         // CLI) the instance owner
-        self.deny_public()?;
         let owner = match self.scope.user() {
             Some(u) => Some(u),
             None => self.instance_owner()?,
         };
-        self.conn.execute(
-            "UPDATE principals SET owner_user = ?1 WHERE id = ?2",
-            params![owner.map(|o| o.to_string()), principal.id.to_string()],
-        )?;
-        self.conn.execute(
+        // each gardener is its own principal (provenance is per-gardener),
+        // created with the gardener in one transaction: a refused gardener
+        // (a taken name) leaves no orphan principal behind (code review
+        // 2026-11-22, item 19)
+        let principal = crate::Principal {
+            id: Uuid::now_v7(),
+            kind: PrincipalKind::Agent,
+            display_name: name.into(),
+            pubkey: None,
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO principals (id, kind, display_name, pubkey, owner_user, name_key) VALUES (?1, 'agent', ?2, NULL, ?3, NULL)",
+            params![principal.id.to_string(), name, owner.map(|o| o.to_string())],
+        )
+        .map_err(tenancy::name_conflict)?;
+        tx.execute(
             "INSERT INTO gardeners (id, name, kind, principal, scope_doc, task_prompt, confidence_policy, owner_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -2483,6 +2567,7 @@ impl BlockStore for SqliteStore {
                 owner.map(|o| o.to_string()),
             ],
         )?;
+        tx.commit()?;
         Ok(Gardener {
             id,
             name: name.into(),
@@ -2934,7 +3019,6 @@ impl BlockStore for SqliteStore {
                 "proposals in a shared workspace are resolved by its members, not by an agent".into(),
             ));
         }
-        let before = tenancy::access_snapshot(&tx)?;
         let kind = parse_annotation_kind(&kind_s)?;
         if parse_annotation_status(&status_s)? != AnnotationStatus::Open {
             return Err(StoreError::InvalidOp(format!(
@@ -2948,6 +3032,11 @@ impl BlockStore for SqliteStore {
             row_to_op,
         )?;
         let op = build_op(raw_op)?;
+        // who sees what changes only through a doc op (a move, a delete,
+        // its restore); a block op's accept or decline touches blocks of one
+        // doc, so the every-user visibility snapshot is skipped for it
+        // (code review 2026-11-22, item 18)
+        let before = if op.kind.is_doc_op() { Some(tenancy::access_snapshot(&tx)?) } else { None };
 
         // the trust invariant (§3.4): proposer ≠ approver, enforced at the
         // gate — for AGENT principals, whose autonomy it bounds. The
@@ -2964,6 +3053,24 @@ impl BlockStore for SqliteStore {
             if kind != "human" {
                 return Err(StoreError::InvalidOp(
                     "proposer cannot resolve their own proposal".into(),
+                ));
+            }
+        }
+        // a red is parked until a PERSON accepts it (the gate's contract):
+        // no agent applies one, whoever proposed it. Comparing principals
+        // alone let an agent accept its own red by switching its `as` label
+        // between propose and resolve (code review 2026-11-22, item 1).
+        if kind == AnnotationKind::Parked && decision == ReviewDecision::Accept {
+            let reviewer_kind: Option<String> = tx
+                .query_row(
+                    "SELECT kind FROM principals WHERE id = ?1",
+                    params![reviewer.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if reviewer_kind.as_deref() != Some("human") {
+                return Err(StoreError::InvalidOp(
+                    "a parked (red) proposal waits for a person to accept it; an agent cannot accept it".into(),
                 ));
             }
         }
@@ -3123,7 +3230,9 @@ impl BlockStore for SqliteStore {
                 )?;
             }
         }
-        tenancy::journal_access_diff(&tx, before)?;
+        if let Some(before) = before {
+            tenancy::journal_access_diff(&tx, before)?;
+        }
         tx.commit()?;
         Ok(receipt)
     }
@@ -3336,6 +3445,20 @@ fn resolve_doc_op(
         | (AnnotationKind::Parked, ReviewDecision::Decline) => Ok(None),
         (AnnotationKind::Review, ReviewDecision::Decline) => {
             let inverse = inverse_of(&op.kind, None)?;
+            // the way back undoes the agent's move; it is not a new move by
+            // the reviewer, so it is not authorized as one. It is honoured
+            // while the old place is still valid FOR THE DOC'S OWNER: the old
+            // parent is live (and not now under the doc), and the space the
+            // doc would land in is one its owner can write. Otherwise (the
+            // old parent is gone, or went somewhere the owner cannot write)
+            // the decline is superseded and the doc stays: content never
+            // lands with people its owner did not put it with (code review
+            // 2026-11-22, item 13, and its review)
+            if let OpKind::MoveDoc { new_parent, .. } = &inverse
+                && !undo_move_still_valid(tx, scope, doc_id, *new_parent)?
+            {
+                return Ok(Some(ApplyReceipt { doc_id, epoch: current, op_ids: vec![] }));
+            }
             project_doc_op(tx, doc_id, &inverse)?;
             let mut note = String::new();
             if let OpKind::RenameDoc { title, from_title } = &inverse {
@@ -3394,6 +3517,44 @@ fn resolve_doc_op(
             }))
         }
     }
+}
+
+/// May a declined agent move be undone, putting `doc` back under
+/// `old_parent` (None: the root)? The old parent must be live and not now
+/// inside `doc` (a cycle), and the space `doc` would land in (its own label,
+/// else the old parent's space, else at the root its owner's Unsorted) must
+/// be one the doc's owner (`docs.owner_id`, else the instance owner) can
+/// write. System/Local skip the space check (one person).
+fn undo_move_still_valid(conn: &Connection, scope: Scope, doc: Uuid, old_parent: Option<Uuid>) -> Result<bool> {
+    if let Some(p) = old_parent {
+        if !doc_is_live(conn, p)? {
+            return Ok(false);
+        }
+        let mut cursor = Some(p);
+        while let Some(c) = cursor {
+            if c == doc {
+                return Ok(false);
+            }
+            cursor = doc_parent_of(conn, c)?;
+        }
+    }
+    if scope.sees_all() {
+        return Ok(true);
+    }
+    let own: Option<String> = conn.query_row("SELECT owner_id FROM docs WHERE id = ?1", params![doc.to_string()], |r| r.get(0))?;
+    let owner = match own.map(|o| uuid_col(o, "docs.owner_id")).transpose()? {
+        Some(o) => Some(o),
+        None => tenancy::instance_owner_conn(conn)?,
+    };
+    let Some(owner) = owner else { return Ok(false) };
+    let to = match crate::workspaces::label_conn(conn, doc)? {
+        Some(w) => tenancy::Space::Workspace(w),
+        None => match old_parent {
+            Some(p) => tenancy::space_conn(conn, p)?,
+            None => tenancy::Space::Unsorted(Some(owner)),
+        },
+    };
+    Ok(tenancy::access_conn(conn, Scope::User(owner), to)?.is_some_and(|r| r.can_write()))
 }
 
 fn get_doc_conn(conn: &Connection, id: Uuid) -> Result<Doc> {
@@ -3590,6 +3751,26 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
+    /// An annotation the scope can see: its kind and the principal of the op
+    /// it flags (the proposer). Invisible = NotFound, like a missing one.
+    pub fn annotation_proposer(&self, annotation_id: Uuid) -> Result<(AnnotationKind, Uuid)> {
+        let raw: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT a.doc_id, a.kind, o.principal FROM annotations a JOIN ops o ON o.id = a.op_id WHERE a.id = ?1",
+                params![annotation_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let missing = || StoreError::NotFound(format!("annotation {annotation_id}"));
+        let (doc, kind, principal) = raw.ok_or_else(missing)?;
+        let doc = uuid_col(doc, "annotations.doc_id")?;
+        if tenancy::ensure_visible_conn(&self.conn, self.scope, doc).is_err() {
+            return Err(missing());
+        }
+        Ok((parse_annotation_kind(&kind)?, uuid_col(principal, "ops.principal")?))
+    }
+
     /// Blocks whose [[wikilinks]] point at this title (exact or path form),
     /// for rewrite-on-rename. Returns (block_id, doc_id, content).
     pub fn linking_blocks(&self, renamed: Uuid, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
@@ -3933,7 +4114,8 @@ impl SqliteStore {
                               + (SELECT count(*) FROM annotations WHERE status != 'open' AND doc_id IN (SELECT id FROM v)) * 7919
                               + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)
                                                      + length(coalesce(status,''))), 0)
-                                 FROM docs WHERE deleted = 0 AND id IN (SELECT id FROM v))",
+                                 FROM docs WHERE deleted = 0 AND id IN (SELECT id FROM v))
+                              + (SELECT COALESCE(sum(rev), 0) FROM doc_row_revs WHERE doc_id IN (SELECT id FROM v)) * 1299709",
                     ),
                     [],
                     |r| r.get(0),
@@ -3963,7 +4145,16 @@ impl SqliteStore {
     /// would fail. The transaction is closed whatever `f` returns.
     pub fn read_snapshot<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> Result<T> {
         self.conn.execute_batch("BEGIN DEFERRED")?;
-        let out = f(self);
+        // a panic inside `f` must not leave the shared connection in an open
+        // transaction: the mutex is recovered after a poison (scope.rs), and
+        // every later BEGIN on it would fail (code review 2026-11-22, item 16)
+        let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(out) => out,
+            Err(panic) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                std::panic::resume_unwind(panic);
+            }
+        };
         self.conn.execute_batch("COMMIT")?;
         Ok(out)
     }
@@ -4509,134 +4700,162 @@ impl SqliteStore {
         ops: Vec<OpInput>,
         cap_review: bool,
     ) -> Result<ProposeOutcome> {
-        if ops.is_empty() {
-            return Err(StoreError::InvalidOp("propose: empty op list".into()));
-        }
-        if let Some(op) = ops.iter().find(|o| o.kind.is_doc_op()) {
-            return Err(StoreError::InvalidOp(format!(
-                "propose: {} is a doc op — use rename_doc/move_doc/set_status/delete_doc",
-                op.kind.op_type()
-            )));
-        }
+        check_propose_ops(&ops)?;
         let policy = self.effective_policy(doc_id)?;
         // the share gate (ADR 0004 §5): an agent writing into a shared
         // workspace never lands green, and `auto` cannot clean it
         let shared_cap = tenancy::agent_into_shared(&self.conn, doc_id, principal)?;
-        let cap_review = cap_review || shared_cap;
         let tx = self.conn.transaction()?;
-        let current = doc_epoch(&tx, doc_id)?;
-        if base_epoch > current {
-            return Err(StoreError::InvalidOp(format!(
-                "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
-            )));
-        }
-
-        let candidate_epoch = current + 1;
-        let mut verdicts = Vec::with_capacity(ops.len());
-        let mut applied_any = false;
-        for op in &ops {
-            let op_id = Uuid::now_v7();
-            let mut op = op.clone();
-            resolve_order_keys(&tx, doc_id, &mut op.kind)?;
-            let op = &op;
-            let mut scored = if base_epoch == current {
-                Scored {
-                    verdict: Verdict::Green,
-                    confidence: 1.0,
-                    note: "current base".into(),
-                }
-            } else {
-                let mut lookup = |id: Uuid| block_by_id(&tx, doc_id, id).ok().flatten();
-                score_stale_op(&op.kind, base_epoch, &mut lookup)
-            };
-            // review cap: greens land as applied, flagged yellows (§5:
-            // auto-tagging as reviewable yellows, declinable as a batch)
-            if cap_review && scored.verdict == Verdict::Green {
-                scored.verdict = Verdict::Yellow;
-                scored.note = if shared_cap {
-                    format!("shared workspace: an agent's edit is flagged for its members; {}", scored.note)
-                } else {
-                    format!("review requested by proposer; {}", scored.note)
-                };
-            }
-
-            let prior = match op.kind.target_block() {
-                Some(t) => block_by_id(&tx, doc_id, t)?,
-                None => None,
-            };
-
-            let mut applied = false;
-            if scored.verdict != Verdict::Red {
-                match project(&tx, doc_id, candidate_epoch, principal, &op.kind) {
-                    Ok(()) => applied = true,
-                    // content-level failure downgrades to a parked red;
-                    // the gate never errors on content
-                    Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
-                        scored = Scored {
-                            verdict: Verdict::Red,
-                            confidence: 0.0,
-                            note: format!("projection failed: {e}"),
-                        };
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            insert_op_row(
-                &tx,
-                op_id,
-                doc_id,
-                op,
-                principal,
-                base_epoch,
-                applied.then_some(candidate_epoch),
-                scored.verdict,
-                scored.confidence,
-                &prior,
-            )?;
-            match scored.verdict {
-                Verdict::Green => {}
-                Verdict::Yellow => {
-                    // auto policy self-applies high-confidence yellows: no flag
-                    let auto_clean = !cap_review
-                        && policy == ReviewPolicy::Auto
-                        && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
-                    if !auto_clean {
-                        insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
-                    }
-                }
-                Verdict::Red => {
-                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
-                }
-            }
-            applied_any |= applied;
-            verdicts.push(ProposeVerdict {
-                op_id,
-                block_id: op.kind.target_block(),
-                verdict: scored.verdict,
-                confidence: scored.confidence,
-                applied,
-                note: scored.note,
-            });
-        }
-
-        let epoch = if applied_any {
-            candidate_epoch
-        } else {
-            current
-        };
-        if applied_any {
-            tx.execute(
-                "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
-                params![epoch, doc_id.to_string()],
-            )?;
-        }
+        let out = propose_in_tx(&tx, doc_id, base_epoch, principal, ops, cap_review, shared_cap, policy)?;
         tx.commit()?;
-        Ok(ProposeOutcome {
-            doc_id,
-            epoch,
-            verdicts,
-        })
+        Ok(out)
     }
+}
+
+/// What `propose` refuses before anything is scored: an empty batch, and
+/// doc ops (which have their own gate, `propose_doc_op`).
+fn check_propose_ops(ops: &[OpInput]) -> Result<()> {
+    if ops.is_empty() {
+        return Err(StoreError::InvalidOp("propose: empty op list".into()));
+    }
+    if let Some(op) = ops.iter().find(|o| o.kind.is_doc_op()) {
+        return Err(StoreError::InvalidOp(format!(
+            "propose: {} is a doc op — use rename_doc/move_doc/set_status/delete_doc",
+            op.kind.op_type()
+        )));
+    }
+    Ok(())
+}
+
+/// `propose_impl` inside the caller's transaction, which it does not
+/// commit: a caller that must be all-or-nothing (the share gate's `apply`,
+/// `create_doc_with_ops`) checks the outcome and commits or drops it.
+/// `shared_cap`: the share gate applies (an agent into a shared workspace);
+/// `policy`: the doc's effective review policy.
+#[allow(clippy::too_many_arguments)]
+fn propose_in_tx(
+    tx: &Transaction,
+    doc_id: Uuid,
+    base_epoch: i64,
+    principal: Uuid,
+    ops: Vec<OpInput>,
+    cap_review: bool,
+    shared_cap: bool,
+    policy: ReviewPolicy,
+) -> Result<ProposeOutcome> {
+    check_propose_ops(&ops)?;
+    let cap_review = cap_review || shared_cap;
+    let current = doc_epoch(tx, doc_id)?;
+    if base_epoch > current {
+        return Err(StoreError::InvalidOp(format!(
+            "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
+        )));
+    }
+
+    let candidate_epoch = current + 1;
+    let mut verdicts = Vec::with_capacity(ops.len());
+    let mut applied_any = false;
+    for op in &ops {
+        let op_id = Uuid::now_v7();
+        let mut op = op.clone();
+        resolve_order_keys(tx, doc_id, &mut op.kind)?;
+        let op = &op;
+        let mut scored = if base_epoch == current {
+            Scored {
+                verdict: Verdict::Green,
+                confidence: 1.0,
+                note: "current base".into(),
+            }
+        } else {
+            let mut lookup = |id: Uuid| block_by_id(tx, doc_id, id).ok().flatten();
+            score_stale_op(&op.kind, base_epoch, &mut lookup)
+        };
+        // review cap: greens land as applied, flagged yellows (§5:
+        // auto-tagging as reviewable yellows, declinable as a batch)
+        if cap_review && scored.verdict == Verdict::Green {
+            scored.verdict = Verdict::Yellow;
+            scored.note = if shared_cap {
+                format!("shared workspace: an agent's edit is flagged for its members; {}", scored.note)
+            } else {
+                format!("review requested by proposer; {}", scored.note)
+            };
+        }
+
+        let prior = match op.kind.target_block() {
+            Some(t) => block_by_id(tx, doc_id, t)?,
+            None => None,
+        };
+
+        let mut applied = false;
+        if scored.verdict != Verdict::Red {
+            match project(tx, doc_id, candidate_epoch, principal, &op.kind) {
+                Ok(()) => applied = true,
+                // content-level failure downgrades to a parked red;
+                // the gate never errors on content
+                Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
+                    scored = Scored {
+                        verdict: Verdict::Red,
+                        confidence: 0.0,
+                        note: format!("projection failed: {e}"),
+                    };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        insert_op_row(
+            &tx,
+            op_id,
+            doc_id,
+            op,
+            principal,
+            base_epoch,
+            applied.then_some(candidate_epoch),
+            scored.verdict,
+            scored.confidence,
+            &prior,
+        )?;
+        match scored.verdict {
+            Verdict::Green => {}
+            Verdict::Yellow => {
+                // auto policy self-applies high-confidence yellows: no flag
+                let auto_clean = !cap_review
+                    && policy == ReviewPolicy::Auto
+                    && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
+                if !auto_clean {
+                    insert_annotation(tx, doc_id, op_id, AnnotationKind::Review)?;
+                }
+            }
+            Verdict::Red => {
+                insert_annotation(tx, doc_id, op_id, AnnotationKind::Parked)?;
+            }
+        }
+        applied_any |= applied;
+        verdicts.push(ProposeVerdict {
+            op_id,
+            block_id: op.kind.target_block(),
+            verdict: scored.verdict,
+            confidence: scored.confidence,
+            applied,
+            note: scored.note,
+        });
+    }
+
+    let epoch = if applied_any {
+        candidate_epoch
+    } else {
+        current
+    };
+    if applied_any {
+        tx.execute(
+            "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+            params![epoch, doc_id.to_string()],
+        )?;
+    }
+    Ok(ProposeOutcome {
+        doc_id,
+        epoch,
+        verdicts,
+    })
 }
 
 /// Doc ops (AX slice B) at the store boundary: ledger shape, gate rules,
@@ -4844,6 +5063,209 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// A gardener that cannot be created (its name is taken) leaves no
+    /// principal behind: the two rows commit together.
+    #[test]
+    fn a_refused_gardener_leaves_no_orphan_principal() {
+        use crate::{BlockStore, ConfidencePolicy, GardenerKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let g = s.create_gardener("tags", GardenerKind::Tagging, "t", None, ConfidencePolicy::Review).unwrap();
+        assert_eq!(s.get_principal(g.principal).unwrap().display_name, "tags");
+        assert!(s.create_gardener("tags", GardenerKind::Tagging, "t", None, ConfidencePolicy::Review).is_err());
+        let n: i64 = s.conn.query_row("SELECT count(*) FROM principals WHERE display_name = 'tags'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "no orphan principal");
+        assert_eq!(s.list_gardeners().unwrap().len(), 1);
+    }
+
+    /// Resolving a block op takes no every-user access snapshot (it cannot
+    /// change who sees what); resolving a doc op still does (code review
+    /// 2026-11-22, item 18). Correctness of the journal is covered by the
+    /// tenancy tests.
+    #[test]
+    fn a_block_op_resolve_skips_the_access_snapshot() {
+        use crate::{BlockStore, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let bot = s.create_principal(PrincipalKind::Agent, "claude:t", None).unwrap().id;
+        let d = s.create_doc("D", None, tom).unwrap().id;
+        let ins = OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(),
+                parent_id: None,
+                order_key: String::new(),
+                block_type: BlockType::Paragraph,
+                content: "x".into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        s.propose_reviewed(d, 0, bot, vec![ins]).unwrap();
+        let ann = s.review_queue(Some(d)).unwrap()[0].annotation.id;
+        let n0 = tenancy::SNAPSHOTS.with(|n| n.get());
+        s.resolve(ann, tom, ReviewDecision::Accept).unwrap();
+        assert_eq!(tenancy::SNAPSHOTS.with(|n| n.get()), n0, "a block op: no snapshot");
+        s.propose_doc_op(d, bot, OpKind::RenameDoc { title: "E".into(), from_title: String::new() }, vec![]).unwrap();
+        let ann = s.review_queue(Some(d)).unwrap()[0].annotation.id;
+        let n1 = tenancy::SNAPSHOTS.with(|n| n.get());
+        s.resolve(ann, tom, ReviewDecision::Decline).unwrap();
+        assert_eq!(tenancy::SNAPSHOTS.with(|n| n.get()), n1 + 1, "a doc op: one snapshot");
+        assert_eq!(s.get_doc(d).unwrap().title, "D");
+    }
+
+    /// A panic inside `read_snapshot` rolls its transaction back: the
+    /// connection is usable afterwards, writes included.
+    #[test]
+    fn a_panic_inside_read_snapshot_leaves_no_open_transaction() {
+        use crate::{BlockStore, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = s.read_snapshot(|_| -> () { panic!("boom") });
+        }));
+        assert!(r.is_err());
+        assert!(s.conn.is_autocommit(), "no transaction left open");
+        s.create_doc("after", None, p).unwrap();
+        assert_eq!(s.read_snapshot(|s| s.list_docs().unwrap().len()).unwrap(), 1);
+    }
+
+    /// Review of this branch, items 4 and 5: a turn an older binary stored
+    /// without a seq is numbered at the next open (after every other), and a
+    /// seq is never handed out twice, even once the turns that held the
+    /// highest are deleted with their runtime.
+    #[test]
+    fn turn_seqs_only_go_up_and_bare_turns_are_numbered_at_open() {
+        use crate::{BlockStore, PrincipalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let (rt, sid, first, tom) = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let tom = s.auth_ensure_owner(p, "tom", 1).unwrap().id;
+            let rt = s.fabric_runtime_create(tom, "mbp", "h1", 1).unwrap().id;
+            let sid = Uuid::now_v7();
+            let t = crate::fabric::FabricTurn {
+                runtime_id: rt,
+                session_id: sid,
+                user_id: tom,
+                turn_id: "t1".into(),
+                address: String::new(),
+                project: String::new(),
+                prompt: String::new(),
+                reply: String::new(),
+                text_off: false,
+                tool_count: 0,
+                outcome: "{}".into(),
+                started: 1,
+                ended: 2,
+                truncated: false,
+                context_used_pct: None,
+                end_kind: "clean".into(),
+                source: "mac".into(),
+                order_id: None,
+                created_at: 2,
+                seq: 0,
+            };
+            let first = s.fabric_turn_put_seq(rt, &t).unwrap().unwrap();
+            // an older binary's insert: no seq
+            s.conn
+                .execute(
+                    "INSERT INTO fabric_turns (runtime_id, session_id, turn_id, user_id, started, ended, created_at)
+                     VALUES (?1, ?2, 'old-binary', ?3, 0, 1, 1)",
+                    params![rt.to_string(), sid.to_string(), tom.to_string()],
+                )
+                .unwrap();
+            (rt, sid, first, tom)
+        };
+        let mut s = SqliteStore::open(&path).unwrap();
+        let got = s.fabric_turns_after_seq(rt, sid, first, 10).unwrap();
+        assert_eq!(got.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(), ["old-binary"], "numbered after t1");
+        let bare = got[0].seq;
+        assert!(bare > first);
+        // the runtime (and its turns) go; a new runtime's turn still gets a
+        // higher seq than any handed out
+        s.conn.execute("DELETE FROM fabric_runtimes WHERE id = ?1", [rt.to_string()]).unwrap();
+        let rt2 = s.fabric_runtime_create(tom, "air", "h2", 1).unwrap().id;
+        let t = crate::fabric::FabricTurn { runtime_id: rt2, turn_id: "t2".into(), ..got[0].clone() };
+        let next = s.fabric_turn_put_seq(rt2, &t).unwrap().unwrap();
+        assert!(next > bare, "{next} > {bare}");
+        drop(s);
+        let mut s = SqliteStore::open(&path).unwrap();
+        let t = crate::fabric::FabricTurn { runtime_id: rt2, turn_id: "t3".into(), ..got[0].clone() };
+        assert!(s.fabric_turn_put_seq(rt2, &t).unwrap().unwrap() > next, "across a reopen too");
+    }
+
+    /// v18: an older database gets `ops_by_target`, and the hot lookups by
+    /// target block use it instead of scanning the ledger.
+    #[test]
+    fn v18_indexes_ops_by_target_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.conn.execute_batch("DROP INDEX ops_by_target; PRAGMA user_version = 17;").unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let plan = |sql: &str| -> String {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            st.query_map(["x"], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
+        };
+        for sql in [
+            // block_readable's shape (history_pred aside)
+            "SELECT EXISTS (SELECT 1 FROM ops WHERE target_block = ?1 AND op_type = 'delete' AND epoch_applied IS NOT NULL)",
+            // ereader_tagger's
+            "SELECT payload FROM ops WHERE target_block = ?1 AND epoch_applied IS NOT NULL ORDER BY rowid DESC",
+        ] {
+            let p = plan(sql);
+            assert!(p.contains("ops_by_target"), "{sql}: {p}");
+        }
+    }
+
+    /// v17: a v16 database's Agent Fabric turns get their insertion
+    /// sequence, numbered in the order they were stored, and the index.
+    #[test]
+    fn v17_numbers_existing_turns_in_stored_order() {
+        use crate::{BlockStore, PrincipalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let (rt, sid) = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let tom = s.auth_ensure_owner(p, "tom", 1).unwrap().id;
+            let rt = s.fabric_runtime_create(tom, "mbp", "h1", 1).unwrap().id;
+            let sid = Uuid::now_v7();
+            for (id, ended) in [("first", 300), ("second", 100)] {
+                s.conn
+                    .execute(
+                        "INSERT INTO fabric_turns (runtime_id, session_id, turn_id, user_id, started, ended, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+                        params![rt.to_string(), sid.to_string(), id, tom.to_string(), ended],
+                    )
+                    .unwrap();
+            }
+            // back to a v16 file: no column, no index
+            s.conn
+                .execute_batch("DROP INDEX fabric_turns_seq; ALTER TABLE fabric_turns DROP COLUMN seq; PRAGMA user_version = 16;")
+                .unwrap();
+            (rt, sid)
+        };
+        let mut s = SqliteStore::open(&path).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let idx: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'fabric_turns_seq'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(idx, 1);
+        let got = s.fabric_turns_after_seq(rt, sid, 0, 10).unwrap();
+        assert_eq!(got.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(), ["first", "second"], "stored order, not ended");
+        assert!(got[0].seq > 0 && got[1].seq > got[0].seq);
+        let t = crate::fabric::FabricTurn { turn_id: "third".into(), seq: 0, ..got[0].clone() };
+        let next = s.fabric_turn_put_seq(rt, &t).unwrap().unwrap();
+        assert!(next > got[1].seq);
     }
 
     /// v7: reviewer gardeners are disabled once (rows and runs kept), and no

@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from 'react-dom'
 import DocEditor, { parser, type EditorSaveState } from '../editor/DocEditor'
 import { splitTree } from '../editor/splitTree'
+import { editorFor, flushDoc } from '../editor/registry'
 import LivingChip from '../LivingChip'
 import EreaderChip from '../EreaderChip'
 import { EREADER_EVENT, loadEreaderStatus, syncDiagramImages, useEreaderStatus } from '../ereader'
@@ -242,16 +243,28 @@ function StatusPill({ doc, readOnly, onChanged }: { doc: Doc; readOnly: boolean;
 }
 
 /** "+ tag": writes the doc's frontmatter (a hidden block) through the gate. */
-function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
+export function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
   const [editing, setEditing] = useState(false)
   const [v, setV] = useState('')
+  // Enter unmounts the input, whose blur fires done again: one tag only
+  // (the same guard as DocTitle's rename)
+  const finishing = useRef(false)
   if (!editing)
     return (
-      <button type="button" className="dv-pill dv-pill-dashed" onClick={() => setEditing(true)}>
+      <button
+        type="button"
+        className="dv-pill dv-pill-dashed"
+        onClick={() => {
+          finishing.current = false
+          setEditing(true)
+        }}
+      >
         + tag
       </button>
     )
   const done = async () => {
+    if (finishing.current) return
+    finishing.current = true
     const t = v.trim().replace(/^#/, '')
     setEditing(false)
     setV('')
@@ -268,6 +281,7 @@ function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
       onKeyDown={(e) => {
         if (e.key === 'Enter') done()
         if (e.key === 'Escape') {
+          finishing.current = true
           setV('')
           setEditing(false)
         }
@@ -342,6 +356,27 @@ function InspectorSheet({ onClose, children }: { onClose: () => void; children: 
 
 /* ---------- the view ---------- */
 
+/** What a fetched tree means for the mounted editor:
+ * - `remount`: it holds something the editor does not show (an epoch past
+ *   what the editor was built from and what our own saves produced, or the
+ *   editor is `behind`), the editor is clean, and the tree is not older than
+ *   our latest save (it would drop our own text);
+ * - `defer`: it does, but the editor is dirty or the tree predates our latest
+ *   save: reload when the editor is next clean;
+ * - `none`: nothing new. */
+export function reloadVerdict(s: {
+  next: number
+  editorEpoch: number
+  ownEpoch: number
+  lastSaved: number
+  behind: boolean
+  clean: boolean
+}): 'remount' | 'defer' | 'none' {
+  const newer = s.next > Math.max(s.editorEpoch, s.ownEpoch) || s.behind
+  if (!newer) return 'none'
+  return s.clean && s.next >= s.lastSaved ? 'remount' : 'defer'
+}
+
 export default function DocView({
   docId,
   onOpenDoc,
@@ -410,13 +445,31 @@ export default function DocView({
     }
   }, [dataVersion])
 
+  const treeRef = useRef<DocTree | null>(null)
+  treeRef.current = tree
+
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
   const [focusThread, setFocusThread] = useState<string | null>(null)
   // epochs this editor produced itself — external changes are anything above
   const ownEpoch = useRef(0)
-  const [editorGen, setEditorGen] = useState(0)
+  // the epoch of the tree the mounted editor was built from
+  const editorEpoch = useRef(0)
+  // the newest epoch any save of ours answered with: a tree older than it
+  // lacks our own text and must never replace the editor's content
+  const lastSaved = useRef(0)
+  // someone else's edit landed that the editor does not show (a save rebased
+  // over it, or a newer tree arrived while typing): reload once clean
+  const behind = useRef(false)
+  // the byline's version: our own saves move it without a tree refetch
+  const [savedEpoch, setSavedEpoch] = useState(0)
+  // remounts of THIS doc's editor (fresh content from the server): it counts
+  // per doc, so another doc opened in this instance starts at 0 and never
+  // restores (and focuses) a cursor from an earlier visit
+  const [gens, setGens] = useState<{ docId: string; n: number }>({ docId, n: 0 })
+  const editorGen = gens.docId === docId ? gens.n : 0
+  const remountEditor = useCallback(() => setGens((g) => ({ docId, n: (g.docId === docId ? g.n : 0) + 1 })), [docId])
   const [saveState, setSaveState] = useState<EditorSaveState>('clean')
   const saveStateRef = useRef<EditorSaveState>('clean')
   saveStateRef.current = saveState
@@ -425,32 +478,93 @@ export default function DocView({
   const phone = useMedia('(max-width: 760px)')
 
   // anchor the comment bubble just above the selected text
-  const onSelectionBlock = useCallback((blockId: string | null) => {
-    setSelBlock(blockId)
-    if (!blockId) {
+  const placeBubble = useCallback(() => {
+    const sel = window.getSelection()
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
       setSelRect(null)
       return
     }
-    requestAnimationFrame(() => {
-      const sel = window.getSelection()
-      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+    const r = sel.getRangeAt(0).getBoundingClientRect()
+    setSelRect({ x: r.left + r.width / 2, y: r.top })
+  }, [])
+  const onSelectionBlock = useCallback(
+    (blockId: string | null) => {
+      setSelBlock(blockId)
+      if (!blockId) {
         setSelRect(null)
         return
       }
-      const r = sel.getRangeAt(0).getBoundingClientRect()
-      setSelRect({ x: r.left + r.width / 2, y: r.top })
-    })
-  }, [])
+      requestAnimationFrame(placeBubble)
+    },
+    [placeBubble],
+  )
+  // the bubble is fixed to the viewport: follow the selection as anything
+  // scrolls (the page or an inner pane, hence capture) or the window resizes
+  const bubbleShown = !!selBlock && selRect != null
+  useEffect(() => {
+    if (!bubbleShown) return
+    let frame = 0
+    const follow = () => {
+      if (frame) return
+      frame = requestAnimationFrame(() => {
+        frame = 0
+        placeBubble()
+      })
+    }
+    window.addEventListener('scroll', follow, { capture: true, passive: true })
+    window.addEventListener('resize', follow)
+    return () => {
+      window.removeEventListener('scroll', follow, { capture: true })
+      window.removeEventListener('resize', follow)
+      if (frame) cancelAnimationFrame(frame)
+    }
+  }, [bubbleShown, placeBubble])
+
+  /** A fetched tree, against what the editor shows (reloadVerdict): remount
+   * the editor with it (unless the editor already shows exactly its blocks),
+   * or remember to once the editor is clean. `always` sets the tree even
+   * when the editor keeps its content (title, comments, status). */
+  const adoptTree = useCallback(
+    (next: DocTree, always: boolean) => {
+      const cur = treeRef.current
+      if (!cur) {
+        editorEpoch.current = next.doc.current_epoch
+        setTree(next)
+        return
+      }
+      const verdict = reloadVerdict({
+        next: next.doc.current_epoch,
+        editorEpoch: editorEpoch.current,
+        ownEpoch: ownEpoch.current,
+        lastSaved: lastSaved.current,
+        behind: behind.current,
+        clean: saveStateRef.current === 'clean',
+      })
+      if (verdict === 'remount') {
+        editorEpoch.current = next.doc.current_epoch
+        behind.current = false
+        // a comment or another hidden-block change: the editor's text is the
+        // doc's already, so it keeps its undo history and cursor
+        const caughtUp = editorFor(docId)?.catchUp(splitTree(next.roots).blocks, next.doc.current_epoch) ?? false
+        setTree(next)
+        if (!caughtUp) remountEditor()
+        return
+      }
+      if (verdict === 'defer') behind.current = true
+      if (always || next.doc.status !== cur.doc.status) setTree(next)
+    },
+    [docId, remountEditor],
+  )
 
   const loadTree = useCallback(() => {
     const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
-      .then((t) => fresh(g) && setTree(t))
+      .then((t) => fresh(g) && adoptTree(t, true))
       .catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
       .then((b) => fresh(g) && setBacklinks(Array.isArray(b) ? b : []))
       .catch(() => fresh(g) && setBacklinks([]))
-  }, [docId, fresh])
+  }, [docId, fresh, adoptTree])
 
   useEffect(() => {
     setTree(null)
@@ -461,6 +575,10 @@ export default function DocView({
     setReviewItems([])
     setHistory([])
     ownEpoch.current = 0
+    editorEpoch.current = 0
+    lastSaved.current = 0
+    behind.current = false
+    setSavedEpoch(0)
     loadTree()
     loadReview()
     loadHistory()
@@ -480,29 +598,25 @@ export default function DocView({
   }, [dataVersion, loadReview, loadHistory])
 
   // after a resolve: content may have moved (yellow decline reverts, red
-  // accept applies) — refetch, remount the editor if the epoch moved
-  const treeRef = useRef<DocTree | null>(null)
-  treeRef.current = tree
+  // accept applies) — land any unsaved typing first, then refetch and
+  // remount the editor if the epoch moved. Remounting over unsaved typing hid
+  // the last keystrokes and the unmount flush then parked them red: a dirty
+  // editor reloads once clean instead (adoptTree)
   const afterResolve = useCallback(() => {
     loadReview()
     loadHistory()
     const g = gen.current
-    api<DocTree>(`/api/doc/${docId}`)
-      .then((next) => {
-        if (!fresh(g)) return
-        const cur = treeRef.current
-        if (!cur || next.doc.current_epoch !== cur.doc.current_epoch) {
-          ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
-          setEditorGen((g) => g + 1)
-        }
-        setTree(next)
-      })
-      .catch(() => {})
-  }, [docId, loadReview, loadHistory, fresh])
+    void flushDoc(docId).then(() =>
+      api<DocTree>(`/api/doc/${docId}`)
+        .then((next) => fresh(g) && adoptTree(next, true))
+        .catch(() => {}),
+    )
+  }, [docId, loadReview, loadHistory, fresh, adoptTree])
 
-  // live refresh: when the store changed and this doc moved past what our own
-  // saves produced, reload it and remount the editor with the fresh content
-  // (skipped while dirty — the pending autosave lands first, next tick catches up)
+  // live refresh: when the store changed and this doc moved past what the
+  // editor shows (its own saves included), reload it and remount the editor
+  // with the fresh content. Skipped while dirty — the pending autosave lands
+  // first, and the editor going clean triggers it again (`behind`)
   const refreshFromStore = useCallback(() => {
     const cur = treeRef.current
     if (!cur) return
@@ -510,25 +624,23 @@ export default function DocView({
     api<DocTree>(`/api/doc/${docId}`)
       .then((next) => {
         if (!fresh(g)) return
-        const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
-        const dirty = saveStateRef.current !== 'clean'
-        if (next.doc.current_epoch > known && !dirty) {
-          setTree(next)
-          setEditorGen((g) => g + 1)
-        } else if (next.doc.status !== cur.doc.status) {
-          setTree(next)
-        }
+        adoptTree(next, false)
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
           .then((b) => fresh(g) && setBacklinks(Array.isArray(b) ? b : []))
           .catch(() => {})
       })
       .catch((e) => console.warn('doc refresh failed', docId, e))
-  }, [docId, fresh])
+  }, [docId, fresh, adoptTree])
   useEffect(() => {
     if (dataVersion === 0) return
     refreshFromStore()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataVersion])
+  // the editor went clean while behind: now show what it missed
+  useEffect(() => {
+    if (saveState === 'clean' && behind.current) refreshFromStore()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [saveState])
 
   // e-readers: the doc's status (the chip, ⌘K's Send / Stop); a sent book's
   // diagrams are drawn and uploaded in the background (once per hash set)
@@ -590,13 +702,14 @@ export default function DocView({
         removedCanvases: 0,
         frontmatter: [] as Block[],
       }
-    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
+    const { blocks, comments, allBlocks, hidden, removedCanvases, frontmatter } = splitTree(tree.roots)
     return {
       editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
       comments,
       allBlocks,
       removedCanvases,
-      frontmatter: allBlocks.filter((b) => b.block_type !== 'comment' && b.block_type !== 'canvas_scene' && b.content.startsWith('---')),
+      // only the first block, and only a closed YAML block: a rule is not it
+      frontmatter: frontmatter ? [frontmatter] : ([] as Block[]),
     }
   }, [tree, docId])
 
@@ -667,6 +780,8 @@ export default function DocView({
     async (annotationId: string, decision: 'accept' | 'decline') => {
       if (resolving) return
       setResolving(true)
+      // unsaved typing lands first, on the doc as it is before the resolve
+      await flushDoc(docId)
       try {
         await api('/api/resolve', {
           method: 'POST',
@@ -679,7 +794,7 @@ export default function DocView({
       setResolving(false)
       afterResolve()
     },
-    [afterResolve, resolving],
+    [afterResolve, resolving, docId],
   )
 
   /* ---------- the inspector ---------- */
@@ -873,7 +988,7 @@ export default function DocView({
             </button>
           </div>
           <DocTitle doc={doc} onRenamed={loadTree} readOnly={readOnly} />
-          <Byline rows={history} epoch={doc.current_epoch} onHistory={() => openTab('history')} />
+          <Byline rows={history} epoch={Math.max(doc.current_epoch, savedEpoch)} onHistory={() => openTab('history')} />
           {removedCanvases > 0 && (
             <div className="dv-notice">
               <Icon name="info" size={15} />
@@ -888,10 +1003,16 @@ export default function DocView({
               reviewExtras={reviewExtras}
               editable={!readOnly}
               onSaveState={setSaveState}
-              onSaved={(e, savedDocId) => {
+              restoreSelection={editorGen > 0}
+              onSaved={(e, savedDocId, own) => {
                 // the unmount flush of a PREVIOUS doc's editor reports its own id
                 if (savedDocId !== docId) return
-                ownEpoch.current = Math.max(ownEpoch.current, e)
+                lastSaved.current = Math.max(lastSaved.current, e)
+                setSavedEpoch((v) => Math.max(v, e))
+                // a save rebased over someone else's edit: that epoch is not
+                // ours alone, and the editor reloads once clean to show it
+                if (own) ownEpoch.current = Math.max(ownEpoch.current, e)
+                else behind.current = true
                 loadHistory()
               }}
               onSelectionBlock={onSelectionBlock}

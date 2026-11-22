@@ -755,8 +755,10 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     let (r, req) = h.authorize(&q).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(r.body.contains("Doc Client"));
-    let c = h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().unwrap();
-    assert_eq!((c.kind.as_str(), c.redirect_uris.clone()), ("cimd", vec![REDIRECT.to_string()]));
+    // held in memory only until someone signs in with it (code review
+    // 2026-11-22, item 2: an unauthenticated /authorize stores nothing)
+    assert!(h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().is_none(), "not stored before a grant");
+    assert_eq!(h.st.cimd.lock().unwrap().len(), 1);
     // a redirect the document does not list
     let q2 = q.replace("33418/callback", "33418/elsewhere");
     assert_eq!(h.authorize(&q2).await.0.status, StatusCode::BAD_REQUEST);
@@ -764,6 +766,88 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     let redirect = h.sign_in(&req.unwrap()).await;
     let code = Url::parse(&redirect).unwrap().query_pairs().find(|(k, _)| k == "code").unwrap().1.into_owned();
     assert_eq!(h.exchange(&id, &code, VERIFIER).await.status, StatusCode::OK);
+    // the grant stored it: its tokens name it, and the sweep keeps it
+    let c = h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().unwrap();
+    assert_eq!((c.kind.as_str(), c.redirect_uris.clone()), ("cimd", vec![REDIRECT.to_string()]));
+    assert_eq!(h.st.cimd.lock().unwrap().len(), 0);
+    h.st.store.lock(taisce_store::Scope::System).oauth_cleanup(now() + 2 * 86400).unwrap();
+    assert!(h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().is_some(), "a signed-in client is never pruned");
+}
+
+/// Review of this branch, item 3: the code is consumed before the CIMD
+/// client is stored, so a store-side failure there must not cost the person
+/// their sign-in. Here the document stops answering after /authorize and the
+/// held copy is gone: the exchange still issues tokens.
+#[tokio::test]
+async fn a_cimd_client_that_cannot_be_stored_still_gets_its_tokens() {
+    let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
+    cfg.cimd_allow_insecure = true;
+    let mut h = harness_with(cfg);
+    assert!(h.enroll().await.status.is_success());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let id = format!("http://{}/client.json", listener.local_addr().unwrap());
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (doc, on) = (json!({"client_id": id, "client_name": "Flaky", "redirect_uris": [REDIRECT]}).to_string(), served.clone());
+    let app = Router::new().route(
+        "/client.json",
+        axum::routing::get(move || {
+            let (doc, on) = (doc.clone(), on.clone());
+            async move {
+                if on.load(std::sync::atomic::Ordering::SeqCst) { (StatusCode::OK, doc) } else { (StatusCode::SERVICE_UNAVAILABLE, String::new()) }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let q = format!("response_type=code&client_id={id}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256");
+    let (r, req) = h.authorize(&q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let redirect = h.sign_in(&req.unwrap()).await;
+    let code = Url::parse(&redirect).unwrap().query_pairs().find(|(k, _)| k == "code").unwrap().1.into_owned();
+    served.store(false, std::sync::atomic::Ordering::SeqCst);
+    *h.st.cimd.lock().unwrap() = crate::auth::oauth::CimdMemory::default();
+    let r = h.exchange(&id, &code, VERIFIER).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.json()["access_token"].is_string());
+}
+
+/// Code review 2026-11-22, item 2: DCR is unauthenticated, so registrations
+/// nobody signs in with are capped (the oldest make room) and swept after a
+/// day; a client someone signed in with is never removed.
+#[tokio::test]
+async fn unused_registrations_are_capped_and_swept_but_signed_in_clients_stay() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let used = h.register("Claude", REDIRECT).await;
+    let code = h.code_for(&used).await;
+    assert_eq!(h.exchange(&used, &code, VERIFIER).await.status, StatusCode::OK);
+    {
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        for i in 0..crate::auth::oauth::MAX_UNUSED_CLIENTS {
+            s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+                client_id: format!("dcr_flood{i:04}"),
+                kind: "dcr".into(),
+                client_name: "flood".into(),
+                redirect_uris: vec![REDIRECT.into()],
+                metadata: "{}".into(),
+                created_at: now() - 10_000 + i as i64,
+                refresh_at: None,
+            })
+            .unwrap();
+        }
+    }
+    let fresh = h.register("Another", REDIRECT).await;
+    {
+        let s = h.st.store.lock(taisce_store::Scope::System);
+        assert!(s.oauth_client("dcr_flood0000").unwrap().is_none(), "the oldest unused client made room");
+        assert!(s.oauth_client("dcr_flood0001").unwrap().is_some());
+        assert!(s.oauth_client(&fresh).unwrap().is_some());
+        assert!(s.oauth_client(&used).unwrap().is_some(), "the signed-in client is never evicted");
+        assert!(s.oauth_client(FIRST_PARTY_APP_CLIENT).unwrap().is_some(), "nor the app's");
+    }
+    h.st.store.lock(taisce_store::Scope::System).oauth_cleanup(now() + 86400 + 1).unwrap();
+    let s = h.st.store.lock(taisce_store::Scope::System);
+    assert!(s.oauth_client(&fresh).unwrap().is_none() && s.oauth_client("dcr_flood0001").unwrap().is_none(), "swept after a day");
+    assert!(s.oauth_client(&used).unwrap().is_some() && s.oauth_client(FIRST_PARTY_APP_CLIENT).unwrap().is_some());
 }
 
 /// A client metadata document may list any redirect it likes; the app's
@@ -1862,8 +1946,11 @@ async fn a_ceremony_lasts_two_minutes() {
     assert_eq!(r.status, StatusCode::GONE, "{}", r.body);
 }
 
+/// Code review 2026-11-22, item 6: a full map no longer refuses sign-ins
+/// (about 125 addresses could lock everyone out); the oldest request makes
+/// room, and an IPv6 /64 is one address.
 #[test]
-fn a_full_pending_map_refuses_new_sign_ins_rather_than_evicting() {
+fn a_full_pending_map_evicts_the_oldest_rather_than_refusing() {
     let h = harness();
     let mut p = passkey::Pending::default();
     let cer = || h.st.webauthn.start_discoverable_authentication().unwrap().1;
@@ -1876,14 +1963,24 @@ fn a_full_pending_map_refuses_new_sign_ins_rather_than_evicting() {
     p.add_web(passkey::WebCeremony { ip: "a".into(), at: t + 1, ceremony: cer() }).unwrap();
     assert_eq!(p.web.keys().filter(|k| mine.contains(k)).count(), passkey::MAX_PENDING_PER_IP - 1);
     assert!(p.web.contains_key(&other));
-    // whole map full (many IPs): a new address is refused, nobody is evicted
+    // whole map full (many IPs): a new address still gets its ceremony; the
+    // oldest anyone holds (A's and B's, at t) make room, newer ones stay
     let mut i = 0;
+    let mut newer = Vec::new();
     while p.web.len() < 1000 {
-        p.add_web(passkey::WebCeremony { ip: format!("ip{i}"), at: t + 1, ceremony: cer() }).unwrap();
+        newer.push(p.add_web(passkey::WebCeremony { ip: format!("10.0.{}.{}", i / 250, i % 250), at: t + 1, ceremony: cer() }).unwrap());
         i += 1;
     }
-    assert!(p.add_web(passkey::WebCeremony { ip: "late".into(), at: t + 1, ceremony: cer() }).is_none());
-    assert!(p.web.contains_key(&other), "the open sign-in is still there");
+    let late = p.add_web(passkey::WebCeremony { ip: "192.0.2.1".into(), at: t + 2, ceremony: cer() });
+    assert!(late.as_ref().is_some_and(|id| p.web.contains_key(id)), "a late sign-in is served, never refused");
+    assert_eq!(p.web.len(), 1000);
+    assert!(newer.iter().all(|id| p.web.contains_key(id)), "only an older ceremony went");
+    // one IPv6 /64 is one address: its ninth replaces its own oldest
+    let v6: Vec<String> = (0..passkey::MAX_PENDING_PER_IP)
+        .map(|n| p.add_web(passkey::WebCeremony { ip: format!("2001:db8:1:2::{n:x}"), at: t + 3, ceremony: cer() }).unwrap())
+        .collect();
+    p.add_web(passkey::WebCeremony { ip: "2001:db8:1:2:ffff::9".into(), at: t + 4, ceremony: cer() }).unwrap();
+    assert_eq!(v6.iter().filter(|id| p.web.contains_key(*id)).count(), passkey::MAX_PENDING_PER_IP - 1);
     // OAuth sign-in requests follow the same per-IP rule
     let req = |ip: &str| passkey::AuthzRequest {
         client_id: "c".into(),

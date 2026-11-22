@@ -317,7 +317,7 @@ async fn download(State(st): State<SentState>, v: Viewer, headers: HeaderMap, Pa
     }
     let user = v.user;
     match with_store(&st.store, v.scope, move |s| one_book(s, id, user)).await {
-        Ok((spec, name)) => match epub::CACHE.get_or_render(&spec) {
+        Ok((spec, name)) => match epub::render_async(spec, user).await {
             Ok(bytes) => epub_response(&bytes, &name),
             Err(e) => render_failed(e),
         },
@@ -613,12 +613,12 @@ async fn list_sent(State(st): State<SentState>, v: Viewer, headers: HeaderMap) -
         Ok(b) => b,
         Err(e) => return fail(e),
     };
+    let sizes = match epub::sizes_async(books.iter().map(|(b, _)| b.spec.clone()).collect(), v.user).await {
+        Ok(s) => s,
+        Err(e) => return render_failed(e),
+    };
     let mut docs = Vec::new();
-    for (b, progress) in books {
-        let size = match epub::CACHE.get_or_render(&b.spec) {
-            Ok(bytes) => bytes.len(),
-            Err(e) => return render_failed(e),
-        };
+    for ((b, progress), size) in books.into_iter().zip(sizes) {
         docs.push(json!({
             "id": b.spec.id,
             "title": b.spec.title,

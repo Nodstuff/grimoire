@@ -47,6 +47,7 @@ fn turn(session: Uuid, id: &str, ended: i64) -> FabricTurn {
         source: "mac".into(),
         order_id: None,
         created_at: ended,
+        seq: 0,
     }
 }
 
@@ -154,6 +155,114 @@ fn turns_after_are_one_sessions_oldest_first() {
     });
     w.s.with_scope_for_test(Scope::User(w.ann), |s| assert!(nf(s.fabric_turns_after(w.rt, sid, 0, 10))));
     w.s.with_scope_for_test(Scope::Public, |s| assert!(nf(s.fabric_turns_after(w.rt, sid, 0, 10))));
+}
+
+/// Code review 2026-11-22, item 4: `ended` is unix seconds, so paging by it
+/// alone skipped every turn that ended in the cursor's second. The compound
+/// cursor (`before_id` / `after_id`) walks every turn exactly once, in both
+/// directions; the old one-key cursor answers exactly as before.
+#[test]
+fn compound_cursors_page_same_second_turns_without_loss() {
+    let mut w = setup();
+    let sid = Uuid::now_v7();
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        // five turns in one second, one before, one after
+        for (id, ended) in [("a", 100), ("s1", 200), ("s2", 200), ("s3", 200), ("s4", 200), ("s5", 200), ("z", 300)] {
+            assert!(s.fabric_turn_put(w.rt, &turn(sid, id, ended)).unwrap());
+        }
+        let ids = |v: &[FabricTurn]| v.iter().map(|t| t.turn_id.clone()).collect::<Vec<_>>();
+        // newest first, two at a time
+        let mut seen = Vec::new();
+        let mut page = s.fabric_turns(w.rt, sid, None, 2).unwrap();
+        while !page.is_empty() {
+            seen.extend(ids(&page));
+            let last = page.last().unwrap().clone();
+            page = s.fabric_turns_before(w.rt, sid, last.ended, &last.turn_id, 2).unwrap();
+        }
+        assert_eq!(seen, ["z", "s5", "s4", "s3", "s2", "s1", "a"], "every turn once, newest first");
+        // the old cursor still skips the rest of the second (unchanged)
+        let first = s.fabric_turns(w.rt, sid, None, 2).unwrap();
+        assert_eq!(ids(&s.fabric_turns(w.rt, sid, Some(first[1].ended), 10).unwrap()), ["a"]);
+        // oldest first from a compound cursor
+        let mut seen = Vec::new();
+        let mut page = s.fabric_turns_after(w.rt, sid, 0, 2).unwrap();
+        while !page.is_empty() {
+            seen.extend(ids(&page));
+            let last = page.last().unwrap().clone();
+            page = s.fabric_turns_after_id(w.rt, sid, last.ended, &last.turn_id, 2).unwrap();
+        }
+        assert_eq!(seen, ["a", "s1", "s2", "s3", "s4", "s5", "z"], "every turn once, oldest first");
+        // a cursor turn that is gone: the one-key answer
+        assert_eq!(ids(&s.fabric_turns_before(w.rt, sid, 200, "gone", 10).unwrap()), ["a"]);
+        assert_eq!(ids(&s.fabric_turns_after_id(w.rt, sid, 200, "gone", 10).unwrap()), ["z"]);
+    });
+    w.s.with_scope_for_test(Scope::User(w.ann), |s| {
+        assert!(nf(s.fabric_turns_before(w.rt, sid, 200, "s3", 10)));
+        assert!(nf(s.fabric_turns_after_id(w.rt, sid, 200, "s3", 10)));
+    });
+}
+
+/// A replayed turn (the runtime's `ended` is in the past) lands behind a
+/// client's `ended` cursor; the insertion sequence still hands it over, in
+/// the order turns were stored. `seq` never repeats, the prune included.
+#[test]
+fn the_insertion_sequence_hands_over_a_replayed_turn() {
+    let mut w = setup();
+    let sid = Uuid::now_v7();
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        let a = s.fabric_turn_put_seq(w.rt, &turn(sid, "a", 100)).unwrap().unwrap();
+        let b = s.fabric_turn_put_seq(w.rt, &turn(sid, "b", 300)).unwrap().unwrap();
+        assert!(b > a);
+        assert_eq!(s.fabric_turn_put_seq(w.rt, &turn(sid, "b", 300)).unwrap(), None, "a replay is not stored again");
+        // the client holds a and b (cursor: ended 300 / seq b); a turn that
+        // ended at 200 arrives late
+        let late = s.fabric_turn_put_seq(w.rt, &turn(sid, "late", 200)).unwrap().unwrap();
+        assert!(s.fabric_turns_after(w.rt, sid, 300, 10).unwrap().is_empty(), "the ended cursor cannot see it");
+        let got = s.fabric_turns_after_seq(w.rt, sid, b, 10).unwrap();
+        assert_eq!((got.len(), got[0].turn_id.as_str(), got[0].seq), (1, "late", late));
+        assert_eq!(s.fabric_turns_since_seq(b, 10).unwrap()[0].turn_id, "late");
+        assert_eq!(s.fabric_turns(w.rt, sid, None, 10).unwrap()[0].seq, b, "reads carry seq");
+    });
+    w.s.with_scope_for_test(Scope::User(w.ann), |s| {
+        assert!(nf(s.fabric_turns_after_seq(w.rt, sid, 0, 10)));
+        assert!(s.fabric_turns_since_seq(0, 10).unwrap().is_empty());
+    });
+    w.s.with_scope_for_test(Scope::Public, |s| assert!(nf(s.fabric_turns_since_seq(0, 10))));
+    // past retention every turn goes, and the next seq is still higher than
+    // any handed out (the counter only goes up)
+    let high = w.s.with_scope_for_test(Scope::User(w.tom), |s| s.fabric_turns(w.rt, sid, None, 10).unwrap().iter().map(|t| t.seq).max().unwrap());
+    let far = 10 * WORK_RETENTION;
+    w.s.with_scope_for_test(Scope::System, |s| s.fabric_work_expire(far).unwrap());
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        assert!(s.fabric_turns(w.rt, sid, None, 10).unwrap().is_empty());
+        let next = s.fabric_turn_put_seq(w.rt, &turn(sid, "next", far)).unwrap().unwrap();
+        assert!(next > high);
+    });
+}
+
+/// Orders page the same way: `(created_at, rowid)` with `before_id`.
+#[test]
+fn orders_page_same_second_rows_without_loss() {
+    let mut w = setup();
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        for (i, id) in ["o1", "o2", "o3", "o4"].into_iter().enumerate() {
+            let at = if id == "o1" { 10 } else { 20 };
+            s.fabric_order_insert(&order(w.rt, id, i as u64 + 1, at)).unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut page = s.fabric_orders(None, None, None, 1).unwrap();
+        while !page.is_empty() {
+            seen.extend(page.iter().map(|o| o.id.clone()));
+            let last = page.last().unwrap().clone();
+            page = s.fabric_orders_before(None, None, last.created_at, &last.id, 1).unwrap();
+        }
+        assert_eq!(seen, ["o4", "o3", "o2", "o1"]);
+        assert_eq!(s.fabric_orders(None, None, Some(20), 10).unwrap().len(), 1, "the one-key cursor is unchanged");
+    });
+    // another person's order id is no cursor into Tom's
+    w.s.with_scope_for_test(Scope::User(w.ann), |s| {
+        assert!(s.fabric_orders_before(None, None, 20, "o3", 10).unwrap().is_empty());
+    });
 }
 
 #[test]

@@ -222,6 +222,25 @@ fn web_session_row(r: &rusqlite::Row) -> rusqlite::Result<WebSession> {
     })
 }
 
+/// What a request authenticated with, by id (`auth_credential_live`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    Grant(Uuid),
+    ApiToken(Uuid),
+    WebSession(Uuid),
+    UploadToken(Uuid),
+}
+
+/// An OAuth client nobody signed in with is pruned this long after it was
+/// registered (`oauth_cleanup`).
+pub const UNUSED_CLIENT_TTL: i64 = 86400;
+/// SQL over `oauth_clients`: a client with no grant (live or revoked; a
+/// revoked grant is kept 30 days for `auth list`), no authorization code
+/// still in flight, and not first party (the app). Such a client is never
+/// behind a token, so removing it signs nobody out.
+const UNUSED_CLIENT_SQL: &str = "client_id NOT IN (SELECT client_id FROM oauth_grants)
+    AND client_id NOT IN (SELECT client_id FROM oauth_codes)
+    AND client_id NOT IN (SELECT client_id FROM oauth_first_party)";
 const WEB_SESSION_COLS: &str = "id, user_id, created_at, last_used_at, expires_at, user_agent, revoked_at, credential_id";
 const USER_COLS: &str = "id, principal_id, name, role, created_at";
 const CRED_COLS: &str = "id, user_id, cred_id, passkey, label, created_at, last_used_at";
@@ -595,6 +614,35 @@ impl SqliteStore {
             .optional()?)
     }
 
+    /// Is the credential a request authenticated with still live: the
+    /// grant unrevoked, the PAT or upload token unrevoked, the web session
+    /// inside its lifetimes, and its user still present? A long-lived
+    /// stream re-checks this to end itself once revoked (code review
+    /// 2026-11-22, item 3).
+    pub fn auth_credential_live(&self, c: Credential, now: i64) -> Result<bool> {
+        let unrevoked = |table: &str, id: Uuid| -> Result<bool> {
+            Ok(self.conn.query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1 AND revoked_at IS NULL
+                         AND user_id IN (SELECT id FROM auth_users))"
+                ),
+                [id.to_string()],
+                |r| r.get(0),
+            )?)
+        };
+        match c {
+            Credential::Grant(id) => unrevoked("oauth_grants", id),
+            Credential::ApiToken(id) => unrevoked("auth_api_tokens", id),
+            Credential::UploadToken(id) => unrevoked("upload_token", id),
+            Credential::WebSession(id) => Ok(self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM auth_web_sessions WHERE id = ?1 AND revoked_at IS NULL
+                     AND expires_at > ?2 AND last_used_at > ?2 - ?3 AND user_id IN (SELECT id FROM auth_users))",
+                params![id.to_string(), now, WEB_SESSION_IDLE],
+                |r| r.get(0),
+            )?),
+        }
+    }
+
     /// Roll `last_used_at` forward, unless it moved in the last minute.
     /// True when it wrote.
     pub fn auth_touch_web_session(&mut self, id: Uuid, now: i64) -> Result<bool> {
@@ -709,6 +757,21 @@ impl SqliteStore {
         tx.execute("INSERT INTO settings (key, value) VALUES (?1, '1') ON CONFLICT (key) DO NOTHING", [KEY])?;
         tx.commit()?;
         Ok(n)
+    }
+
+    /// Keep at most `keep` unused clients (no grant, no code in flight, not
+    /// first party): delete the oldest beyond that. Registration is
+    /// unauthenticated, so this bounds what it can add between sweeps.
+    /// Returns how many went.
+    pub fn oauth_evict_unused_clients(&mut self, keep: usize) -> Result<usize> {
+        Ok(self.conn.execute(
+            &format!(
+                "DELETE FROM oauth_clients WHERE client_id IN (
+                     SELECT client_id FROM oauth_clients WHERE {UNUSED_CLIENT_SQL}
+                     ORDER BY created_at DESC, client_id DESC LIMIT -1 OFFSET ?1)"
+            ),
+            [keep as i64],
+        )?)
     }
 
     pub fn oauth_upsert_client(&mut self, c: &OAuthClient) -> Result<()> {
@@ -1036,6 +1099,13 @@ impl SqliteStore {
         )?;
         n += tx.execute("DELETE FROM oauth_grants WHERE revoked_at IS NOT NULL AND revoked_at <= ?1 - 2592000", [now])?;
         n += tx.execute("DELETE FROM auth_enrollments WHERE expires_at <= ?1", [now])?;
+        // clients registered (DCR, unauthenticated) a day ago that nobody
+        // ever signed in with: no grant (live, revoked or recent), no code
+        // still in flight, never first party (code review 2026-11-22, item 2)
+        n += tx.execute(
+            &format!("DELETE FROM oauth_clients WHERE created_at <= ?1 - ?2 AND {UNUSED_CLIENT_SQL}"),
+            params![now, UNUSED_CLIENT_TTL],
+        )?;
         // web sessions: gone 30 days after they ended (revoked, lapsed, idle),
         // so `auth list` still shows a recent sign-out
         n += tx.execute(
@@ -1419,6 +1489,88 @@ mod tests {
         );
         assert!(s.oauth_access_grant("a2", 212).unwrap().is_none());
         assert_eq!(s.oauth_grants(false).unwrap().len(), 0);
+    }
+
+    /// Code review 2026-11-22, item 3: what a stream re-checks.
+    #[test]
+    fn a_credential_is_live_until_revoked_or_lapsed() {
+        let (mut s, u) = store_with_owner();
+        let g = grant(&u, 100);
+        s.oauth_issue_grant(None, &g, "a1", 200, "r1", 300).unwrap();
+        assert!(s.auth_credential_live(Credential::Grant(g.id), 150).unwrap());
+        s.oauth_revoke_grant(&g.id.to_string(), "test", 160).unwrap();
+        assert!(!s.auth_credential_live(Credential::Grant(g.id), 170).unwrap());
+        let t = s.auth_create_api_token(u.id, "cc", "h1", 100).unwrap();
+        assert!(s.auth_credential_live(Credential::ApiToken(t.id), 150).unwrap());
+        s.auth_revoke_api_token("cc", 160).unwrap().unwrap();
+        assert!(!s.auth_credential_live(Credential::ApiToken(t.id), 170).unwrap());
+        let w = s.auth_create_web_session(u.id, None, "w1", "", 100).unwrap();
+        assert!(s.auth_credential_live(Credential::WebSession(w.id), 150).unwrap());
+        assert!(!s.auth_credential_live(Credential::WebSession(w.id), 100 + WEB_SESSION_IDLE + 1).unwrap(), "idle lapsed");
+        s.auth_revoke_web_session(&w.id.to_string(), 160).unwrap().unwrap();
+        assert!(!s.auth_credential_live(Credential::WebSession(w.id), 170).unwrap());
+        assert!(!s.auth_credential_live(Credential::Grant(Uuid::now_v7()), 170).unwrap(), "unknown is not live");
+    }
+
+    fn client(id: &str, at: i64) -> OAuthClient {
+        OAuthClient {
+            client_id: id.into(),
+            kind: "dcr".into(),
+            client_name: id.into(),
+            redirect_uris: vec!["http://127.0.0.1/cb".into()],
+            metadata: "{}".into(),
+            created_at: at,
+            refresh_at: None,
+        }
+    }
+
+    /// Code review 2026-11-22, item 2: unauthenticated registrations no
+    /// longer pile up. A client nobody signed in with goes a day after it
+    /// was registered; one behind a grant (even revoked), a code in flight
+    /// or first party never does. The cap keeps the newest unused ones.
+    #[test]
+    fn unused_clients_are_pruned_and_capped_but_signed_in_ones_stay() {
+        let (mut s, u) = store_with_owner();
+        let t0 = 1_000_000;
+        for id in ["c1", "revoked", "coded", "app", "stale", "young"] {
+            s.oauth_upsert_client(&client(id, if id == "young" { t0 + 80_000 } else { t0 })).unwrap();
+        }
+        s.oauth_issue_grant(None, &grant(&u, t0), "a1", t0 + 10, "r1", t0 + 20).unwrap();
+        let mut g = grant(&u, t0);
+        g.client_id = "revoked".into();
+        s.oauth_issue_grant(None, &g, "a2", t0 + 10, "r2", t0 + 20).unwrap();
+        s.oauth_revoke_grant(&g.id.to_string(), "test", t0 + 5).unwrap();
+        s.oauth_insert_code(&AuthCode {
+            code_hash: "h".into(),
+            client_id: "coded".into(),
+            user_id: u.id,
+            redirect_uri: "http://127.0.0.1/cb".into(),
+            code_challenge: "x".into(),
+            resource: None,
+            scope: "grimoire".into(),
+            expires_at: t0 + 90_000,
+            credential_id: None,
+        })
+        .unwrap();
+        s.oauth_mark_first_party("app", t0).unwrap();
+        s.oauth_cleanup(t0 + UNUSED_CLIENT_TTL + 1).unwrap();
+        let left = |s: &SqliteStore| {
+            let mut v: Vec<String> = ["c1", "revoked", "coded", "app", "stale", "young"]
+                .into_iter()
+                .filter(|id| s.oauth_client(id).unwrap().is_some())
+                .map(String::from)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(left(&s), vec!["app", "c1", "coded", "revoked", "young"], "only the stale unused client went");
+        // the cap: keep the newest unused one, never a used one
+        for i in 0..3 {
+            s.oauth_upsert_client(&client(&format!("burst{i}"), t0 + 90_000 + i)).unwrap();
+        }
+        assert_eq!(s.oauth_evict_unused_clients(1).unwrap(), 3, "young, burst0, burst1 go");
+        assert!(s.oauth_client("burst2").unwrap().is_some());
+        assert_eq!(left(&s), vec!["app", "c1", "coded", "revoked"]);
     }
 
     #[test]

@@ -840,11 +840,13 @@ async fn docs_feed(State(st): State<OpdsState>, Extension(client): Extension<Opd
     let mut x = feed_head("urn:taisce:docs", "Docs", &rfc3339(now()));
     spine_links(&mut x, prefix, &format!("{prefix}/docs"), ACQ_CT);
     x.push_str(&format!("<link rel=\"up\" type=\"{NAV_CT}\" href=\"{prefix}/\"/>\n"));
-    for b in &books {
-        let size = match crate::epub::CACHE.get_or_render(&b.spec) {
-            Ok(bytes) => bytes.len(),
-            Err(e) => return crate::sentdocs::render_failed(e),
-        };
+    // sizes off the async workers; one remembered from an earlier render
+    // costs nothing
+    let sizes = match crate::epub::sizes_async(books.iter().map(|b| b.spec.clone()).collect(), Some(user)).await {
+        Ok(s) => s,
+        Err(e) => return crate::sentdocs::render_failed(e),
+    };
+    for (b, size) in books.iter().zip(sizes) {
         x.push_str(&doc_entry_xml(b, size, prefix));
         x.push('\n');
     }
@@ -868,7 +870,7 @@ async fn doc_file(st: &OpdsState, client: &OpdsClient, id: Uuid) -> Response {
     })
     .await;
     match found {
-        Ok(Some((spec, name))) => match crate::epub::CACHE.get_or_render(&spec) {
+        Ok(Some((spec, name))) => match crate::epub::render_async(spec, Some(user)).await {
             Ok(bytes) => crate::sentdocs::epub_response(&bytes, &name),
             Err(e) => crate::sentdocs::render_failed(e),
         },

@@ -397,6 +397,7 @@ impl Hub {
                     source: source.clone(),
                     order_id: (!t.order_id.is_empty()).then(|| t.order_id.clone()),
                     created_at: now,
+                    seq: 0,
                 };
                 // Text off: the live stream shows it, the store never holds it
                 let mut stored = row.clone();
@@ -404,8 +405,11 @@ impl Hub {
                     stored.prompt.clear();
                     stored.reply.clear();
                 }
-                let fresh = with_store(&store, Scope::User(user), move |s| s.fabric_turn_put(runtime, &stored)).await.map_err(Refused::Store)?;
-                if fresh {
+                let fresh = with_store(&store, Scope::User(user), move |s| s.fabric_turn_put_seq(runtime, &stored)).await.map_err(Refused::Store)?;
+                if let Some(seq) = fresh {
+                    // the live event carries the stored seq: a phone's cursor
+                    let mut row = row.clone();
+                    row.seq = seq;
                     after.changes.push(Change::Turn(TurnView::from(&row)));
                     // a turn the person started from the phone tells the
                     // phone when it ends, even while they are at the Mac

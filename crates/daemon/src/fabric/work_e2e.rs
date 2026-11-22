@@ -142,11 +142,41 @@ async fn turns_after_top_up_a_held_feed_oldest_first() {
     let want = ids(&all);
     let first = t.get(&format!("{path}?after=0&limit=2")).await;
     assert_eq!((ids(&first), first["more"].as_bool()), (want[..2].to_vec(), Some(true)), "{first}");
+    // the one-key cursor (old clients, unchanged): `after=<ended of the
+    // second>` skips the third, which ended in the same second
+    let lossy = t.get(&format!("{path}?after={}", ended(&first)[1])).await;
+    assert_eq!(lossy["turns"].as_array().map(Vec::len), Some(0), "{lossy}");
+    // the compound cursor (code review 2026-11-22, item 4): exactly the third
+    let next = t.get(&format!("{path}?after={}&after_id={}&limit=2", ended(&first)[1], want[1])).await;
+    assert_eq!((ids(&next), next["more"].as_bool()), (want[2..].to_vec(), Some(false)), "{next}");
+    // and back again, newest first: before + before_id walks all three
+    let newest_two = t.get(&format!("{path}?limit=2")).await;
+    let (n_ids, n_ended) = (ids(&newest_two), ended(&newest_two));
+    let older = t.get(&format!("{path}?before={}&before_id={}&limit=2", n_ended[1], n_ids[1])).await;
+    let mut walked = [n_ids, ids(&older)].concat();
+    assert_eq!(older["more"].as_bool(), Some(false), "{older}");
+    walked.sort();
+    let mut every = want.clone();
+    every.sort();
+    assert_eq!(walked, every, "newest first, every turn once");
     let last = ended(&all)[2];
     let none = t.get(&format!("{path}?after={last}")).await;
     assert_eq!((none["turns"].as_array().map(Vec::len), none["more"].as_bool()), (Some(0), Some(false)), "{none}");
     let (st, _) = t.send("GET", &format!("{path}?after=0&before=9999999999"), None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = t.send("GET", &format!("{path}?after_id=a1"), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an _id needs its time");
+    // the insertion sequence: every turn carries seq; after_seq is what was
+    // stored since, in stored order (a replayed turn's past ended included)
+    let seqs: Vec<i64> = all["turns"].as_array().unwrap().iter().map(|t| t["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.iter().all(|s| *s > 0), "{all}");
+    let min = *seqs.iter().min().unwrap();
+    let rest = t.get(&format!("{path}?after_seq={min}")).await;
+    assert_eq!(rest["turns"].as_array().map(Vec::len), Some(2), "{rest}");
+    let since = t.get(&format!("/api/fabric/turns?since_seq={min}")).await;
+    assert_eq!(since["turns"].as_array().map(Vec::len), Some(2), "{since}");
+    let (st, _) = t.send("GET", &format!("{path}?after_seq=0&after=0"), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "after_seq stands alone");
 }
 
 #[tokio::test]

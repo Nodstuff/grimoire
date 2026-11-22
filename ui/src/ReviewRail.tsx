@@ -4,6 +4,7 @@
 // card scrolls to its block.
 
 import { useState } from 'react'
+import { flushAll } from './editor/registry'
 import { api, QueueRow } from './types'
 import { errText, notify } from './Notice'
 import { actionLabels, describeChange, targetBlockOf } from './review'
@@ -43,6 +44,8 @@ export default function ReviewRail({
 
   const resolve = async (annotationId: string, decision: 'accept' | 'decline') => {
     setBusy(annotationId)
+    // unsaved typing lands first, on the doc as it is before the resolve
+    await flushAll()
     try {
       await api('/api/resolve', {
         method: 'POST',
@@ -60,6 +63,7 @@ export default function ReviewRail({
     const ids = items.map((r) => r.item.annotation.id)
     if (ids.length === 0) return
     setBusy('bulk')
+    await flushAll()
     try {
       await api('/api/resolve_bulk', {
         method: 'POST',

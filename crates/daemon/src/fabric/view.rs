@@ -376,6 +376,8 @@ pub struct TurnView {
     pub source: String,
     pub order_id: Option<String>,
     pub text_off: bool,
+    /// The server's insertion sequence (`after_seq` / `since_seq`).
+    pub seq: i64,
 }
 
 impl From<&FabricTurn> for TurnView {
@@ -397,6 +399,7 @@ impl From<&FabricTurn> for TurnView {
             source: t.source.clone(),
             order_id: t.order_id.clone(),
             text_off: t.text_off,
+            seq: t.seq,
         }
     }
 }

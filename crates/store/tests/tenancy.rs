@@ -1109,3 +1109,193 @@ fn renaming_back_to_your_own_name_never_clashes_with_yourself() {
     let b = store.lock(Scope::System).auth_find_user("Aoife").unwrap().unwrap().id;
     assert!(store.lock(Scope::User(b)).rename_principal(b_human, "tom").is_err(), "never another person's");
 }
+
+/// Code review 2026-11-22, item 17: a person's change stamp moves on a
+/// same-length rename and on a review-policy change of a doc they can see,
+/// and still not on anything of another person's.
+#[test]
+fn the_user_stamp_sees_same_length_renames_and_policy_changes_but_not_others() {
+    let t = setup();
+    let stamp = |u: Uuid| t.store.lock(Scope::User(u)).change_stamp().unwrap();
+    let b0 = stamp(t.b);
+    let a0 = stamp(t.a);
+    let title = t.store.lock(Scope::User(t.b)).get_doc(t.b_doc).unwrap().title;
+    let same_len = "z".repeat(title.len());
+    assert_ne!(same_len, title);
+    t.store.lock(Scope::User(t.b)).rename_doc(t.b_doc, &same_len).unwrap();
+    let b1 = stamp(t.b);
+    assert_ne!(b0, b1, "a same-length rename moves the stamp");
+    t.store.lock(Scope::User(t.b)).set_review_policy(t.b_doc, Some(ReviewPolicy::Auto)).unwrap();
+    let b2 = stamp(t.b);
+    assert_ne!(b1, b2, "a policy change moves the stamp");
+    t.store.lock(Scope::User(t.b)).set_review_policy(t.b_doc, Some(ReviewPolicy::HumanReview)).unwrap();
+    t.store.lock(Scope::User(t.b)).set_review_policy(t.b_doc, Some(ReviewPolicy::AgentReview)).unwrap();
+    assert_ne!(b2, stamp(t.b), "same-length policies too");
+    assert_eq!(a0, stamp(t.a), "B's changes do not move A's stamp");
+    let b3 = stamp(t.b);
+    let a_title = t.store.lock(Scope::User(t.a)).get_doc(t.a_secret).unwrap().title;
+    let a_same = "z".repeat(a_title.len());
+    t.store.lock(Scope::User(t.a)).rename_doc(t.a_secret, &a_same).unwrap();
+    t.store.lock(Scope::User(t.a)).set_review_policy(t.a_secret, Some(ReviewPolicy::Auto)).unwrap();
+    assert_eq!(b3, stamp(t.b), "A's private changes do not move B's stamp");
+}
+
+/// Code review 2026-11-22, item 13: declining a flagged agent move runs the
+/// move's checks on the way back. B's agent moved D out from under X; X then
+/// went into A's Family (B an editor), and B was made a viewer. Reverting
+/// would put B's doc into a workspace she cannot write: the decline is
+/// treated as superseded and D stays where it is.
+#[test]
+fn declining_an_agent_move_does_not_move_a_doc_where_the_reviewer_cannot() {
+    let t = setup();
+    let (x, d, ann) = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let b_agent = s.create_principal(PrincipalKind::Agent, "claude:b-agent", None).unwrap().id;
+        let x = s.create_doc("X", None, t.b_human).unwrap().id;
+        let d = s.create_doc("D", Some(x), t.b_human).unwrap().id;
+        let out = s
+            .propose_doc_op(d, b_agent, OpKind::MoveDoc {
+                new_parent: None,
+                sort_key: None,
+                new_parent_title: None,
+                from_parent: None,
+                from_sort_key: None,
+                from_parent_title: None,
+            }, vec![])
+            .unwrap();
+        assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
+        let ann = s.review_queue(Some(d)).unwrap().pop().unwrap().annotation.id;
+        (x, d, ann)
+    };
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    t.store.lock(Scope::User(t.b)).move_doc(x, Some(t.shared_doc), None).unwrap();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Viewer).unwrap();
+    let mut s = t.store.lock(Scope::User(t.b));
+    let receipt = s.resolve(ann, t.b_human, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(receipt.op_ids.is_empty(), "superseded: nothing reverted");
+    assert_eq!(s.get_doc(d).unwrap().parent_id, None, "D stays in B's Unsorted");
+    assert_eq!(s.doc_workspace(d).unwrap(), None);
+    assert!(s.review_queue(Some(d)).unwrap().is_empty(), "the flag is closed");
+    drop(s);
+    // A sees nothing of D
+    not_found(t.store.lock(Scope::User(t.a)).get_doc(d));
+}
+
+/// Code review 2026-11-22, item 12 (Trash): B filed her own doc into A's
+/// Family and wrote under it; after B leaves, A restores a doc whose parent
+/// is still in the Trash. It surfaces at Family's top level, never in B's
+/// Unsorted (she is no longer a member) nor out of the workspace.
+#[test]
+fn a_restored_doc_stays_in_its_workspace_and_never_lands_with_a_former_member() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let (rb, p, d) = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let rb = s.create_doc("B's own", None, t.b_human).unwrap().id;
+        s.set_doc_workspace(rb, Some(t.family), t.b_human).unwrap();
+        let p = s.create_doc("P", Some(rb), t.b_human).unwrap().id;
+        let (d, _) = s.create_doc_with_ops("D", Some(p), t.b_human, vec![para("family content")]).unwrap();
+        (rb, p, d.id)
+    };
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        s.delete_doc(d).unwrap();
+        s.delete_doc(p).unwrap();
+        s.unshare_workspace(t.family, t.b).unwrap();
+        s.restore_doc(d).unwrap();
+        assert_eq!(s.get_doc(d).unwrap().parent_id, None, "its parent is still in the Trash");
+        assert_eq!(s.doc_workspace(d).unwrap(), Some(t.family), "still in Family");
+    }
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(d));
+    let _ = rb;
+}
+
+/// Code review 2026-11-22, item 12 (delete): B's contribution to Family,
+/// left behind when she was removed, goes to Family's owner when the
+/// workspace is deleted, not back to B.
+#[test]
+fn deleting_a_workspace_never_hands_a_doc_to_a_former_member() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let rb = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let (rb, _) = s.create_doc_with_ops("B's filed doc", None, t.b_human, vec![para("written together")]).unwrap();
+        s.set_doc_workspace(rb.id, Some(t.family), t.b_human).unwrap();
+        rb.id
+    };
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        s.unshare_workspace(t.family, t.b).unwrap();
+        s.delete_workspace(t.family).unwrap();
+        assert!(s.get_doc(rb).is_ok(), "A keeps it");
+    }
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(rb));
+}
+
+/// Code review 2026-11-22, item 14: the share gate's write paths are
+/// all-or-nothing. An agent's `apply` into a shared doc whose second op
+/// cannot apply is refused with nothing written (it used to commit the
+/// first op and then answer an error); an agent's `create_doc_with_ops`
+/// under a shared parent that fails leaves no empty doc behind.
+#[test]
+fn the_share_gates_writes_are_all_or_nothing() {
+    let t = setup();
+    let mut s = t.store.lock(Scope::User(t.a));
+    let before = s.read_doc(t.shared_doc).unwrap();
+    let epoch = s.get_doc(t.shared_doc).unwrap().current_epoch;
+    let queue = s.review_queue(None).unwrap().len();
+    let missing = OpInput { kind: OpKind::Replace { target: Uuid::now_v7(), content: "x".into() }, source_refs: vec![] };
+    let err = s.apply(t.shared_doc, epoch, t.agent, vec![para("first, fine"), missing]);
+    assert!(err.is_err(), "{err:?}");
+    assert_eq!(s.get_doc(t.shared_doc).unwrap().current_epoch, epoch, "no epoch moved");
+    assert_eq!(s.read_doc(t.shared_doc).unwrap().roots.len(), before.roots.len(), "the first op did not land");
+    assert_eq!(s.review_queue(None).unwrap().len(), queue, "no flag or park left behind");
+    // a gated create that fails: no doc
+    let doc_op = OpInput { kind: OpKind::SetStatus { status: Some(DocStatus::Draft), from_status: None }, source_refs: vec![] };
+    let err = s.create_doc_with_ops("Half made", Some(t.shared_doc), t.agent, vec![para("body"), doc_op]);
+    assert!(err.is_err(), "{err:?}");
+    assert!(s.list_docs().unwrap().iter().all(|d| d.title != "Half made"), "no empty doc committed");
+    // and the happy paths still land, flagged
+    let r = s.apply(t.shared_doc, epoch, t.agent, vec![para("agent line")]).unwrap();
+    assert_eq!(r.epoch, epoch + 1);
+    let (made, _) = s.create_doc_with_ops("Made", Some(t.shared_doc), t.agent, vec![para("body")]).unwrap();
+    assert_eq!(s.review_queue(Some(made.id)).unwrap().len(), 1);
+}
+
+/// Review of the fix branch (item 13 follow-up): a member's decline of an
+/// agent's move is honoured whenever the old place is still valid for the
+/// doc's owner, even if the decliner cannot see the old parent. A's doc D,
+/// filed into Family under A's private X, is moved within Family by A's
+/// agent; B (a Family editor) declines: D goes back under X, still in Family,
+/// and B never sees X.
+#[test]
+fn a_members_decline_of_an_agent_move_restores_the_owners_place() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let (x, d) = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let x = s.create_doc("A's private X", None, t.a_human).unwrap().id;
+        let d = s.create_doc("Filed D", Some(x), t.a_human).unwrap().id;
+        s.set_doc_workspace(d, Some(t.family), t.a_human).unwrap();
+        let out = s
+            .propose_doc_op(d, t.agent, OpKind::MoveDoc {
+                new_parent: Some(t.shared_doc),
+                sort_key: None,
+                new_parent_title: None,
+                from_parent: None,
+                from_sort_key: None,
+                from_parent_title: None,
+            }, vec![])
+            .unwrap();
+        assert_eq!(out.verdicts[0].verdict, Verdict::Yellow, "within Family: flagged, applied");
+        (x, d)
+    };
+    let ann = t.store.lock(Scope::User(t.b)).review_queue(Some(d)).unwrap().pop().unwrap().annotation.id;
+    let receipt = t.store.lock(Scope::User(t.b)).resolve(ann, t.b_human, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(!receipt.op_ids.is_empty(), "reverted, not superseded");
+    let a = t.store.lock(Scope::User(t.a));
+    assert_eq!(a.get_doc(d).unwrap().parent_id, Some(x), "back under X");
+    assert_eq!(a.doc_workspace(d).unwrap(), Some(t.family), "still in Family");
+    drop(a);
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(x));
+}

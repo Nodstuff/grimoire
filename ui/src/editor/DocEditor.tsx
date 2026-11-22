@@ -5,6 +5,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { EditorContent, ReactNodeViewRenderer, useEditor } from '@tiptap/react'
 import { Extension, getSchema } from '@tiptap/core'
+import { Plugin, PluginKey } from '@tiptap/pm/state'
+import { Fragment, Slice } from '@tiptap/pm/model'
 import StarterKit from '@tiptap/starter-kit'
 import CodeBlock from '@tiptap/extension-code-block'
 import { TableKit } from '@tiptap/extension-table'
@@ -13,13 +15,16 @@ import { WikilinkDeco } from './WikilinkDeco'
 import { CodeHighlight } from './CodeHighlight'
 import { ReviewHighlight, ReviewMap, ReviewExtras, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
-import { api, Block } from '../types'
+import type { Transaction } from '@tiptap/pm/state'
+import { api, ApiError, Block } from '../types'
+import { withCsrf } from '../auth'
 import { notify } from '../Notice'
-import { saveErrorText } from '../hints'
-import { BaselineBlock, Entry, HiddenBlock, computeOps } from './diff'
+import { isPermanentSaveError, permanentSaveErrorText, saveErrorText } from '../hints'
+import { BaselineBlock, Entry, HiddenBlock, Op, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
-import { AfterSave, afterSave } from './savePlan'
+import { AfterSave, PendingRequest, afterSave, requestFor } from './savePlan'
+import { registerEditor } from './registry'
 import './editor.css'
 
 /** transaction meta marking DocEditor's own post-save blockId stamping, so
@@ -57,7 +62,46 @@ const BlockId = Extension.create({
       },
     ]
   },
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: new PluginKey('blockIdPaste'),
+        props: {
+          // a pasted copy of a block still in this doc must not carry its id
+          // (two nodes, one block): it is a new block. An id the doc no
+          // longer holds (cut, then pasted) stays, so a move keeps its id;
+          // one from another doc is given a fresh id by planSave.
+          transformPasted: (slice, view) => {
+            // a drag that moves its blocks: prosemirror-view transforms the
+            // slice before deleting the source, so its ids still look present;
+            // they are the same blocks moving, and keep their ids
+            if (view.dragging?.move) return slice
+            const present = new Set<string>()
+            view.state.doc.forEach((n) => {
+              if (n.attrs.blockId) present.add(n.attrs.blockId)
+            })
+            return present.size ? new Slice(withoutIds(slice.content, present), slice.openStart, slice.openEnd) : slice
+          },
+        },
+      }),
+    ]
+  },
 })
+
+/** `frag` with every blockId in `drop` cleared, at any depth. */
+export function withoutIds(frag: Fragment, drop: Set<string>): Fragment {
+  const out: PMNode[] = []
+  frag.forEach((n) => {
+    if (n.isText) {
+      out.push(n)
+      return
+    }
+    const id = n.attrs.blockId as string | null | undefined
+    const content = withoutIds(n.content, drop)
+    out.push(id && drop.has(id) ? n.type.create({ ...n.attrs, blockId: null }, content, n.marks) : n.copy(content))
+  })
+  return Fragment.from(out)
+}
 
 /** The editor extension set. */
 export function makeExtensions() {
@@ -92,6 +136,58 @@ export interface EditableDoc {
   hidden?: HiddenBlock[]
 }
 
+/** A place in the doc by block, not by absolute position: the `nth` node
+ * carrying `id` (a block can span nodes) and the offset inside it. Fresh
+ * content from the server moves absolute positions (an agent lengthened a
+ * block above), never this. */
+export interface BlockLoc {
+  id: string
+  nth: number
+  offset: number
+}
+
+/** Where `pos` is, by block; null between top-level nodes or in a node
+ * without an id. */
+export function locate(doc: PMNode, pos: number): BlockLoc | null {
+  if (pos < 0 || pos > doc.content.size) return null
+  const $pos = doc.resolve(pos)
+  if ($pos.depth < 1) return null
+  const id = $pos.node(1).attrs.blockId as string | null
+  if (!id) return null
+  const index = $pos.index(0)
+  let nth = 0
+  for (let i = 0; i < index; i++) if (doc.child(i).attrs.blockId === id) nth++
+  return { id, nth, offset: pos - $pos.before(1) }
+}
+
+/** The position `loc` names in `doc` (its offset clamped into the node), or
+ * null when that block is gone. */
+export function resolveLoc(doc: PMNode, loc: BlockLoc): number | null {
+  let seen = 0
+  let out: number | null = null
+  doc.forEach((node, start) => {
+    if (out != null || node.attrs.blockId !== loc.id) return
+    if (seen++ === loc.nth) out = Math.max(start + 1, Math.min(start + loc.offset, start + node.nodeSize - 1))
+  })
+  return out
+}
+
+/** Where the cursor was when an editor unmounted, per doc, by block: a
+ * remount of the same doc (fresh content from the server) puts it back. */
+const selectionMemo = new Map<string, { anchor: BlockLoc | null; head: BlockLoc | null; focused: boolean }>()
+
+/** True when a save's answer is the very next epoch after its base: nobody
+ * else wrote in between, so the editor shows everything the doc holds. A
+ * jump past base + 1 means the daemon rebased the save over someone else's
+ * edits (which this editor does not show); no jump means nothing applied. */
+export function isOwnEpoch(base: number, epoch: number): boolean {
+  return epoch === base + 1
+}
+
+/** A propose sent (or about to be) and what it writes, for adopting its
+ * answer whenever it comes. */
+type Unsent = PendingRequest & { entries: Entry[]; ops: Op[]; base: number }
+
 type SaveState = 'clean' | 'dirty' | 'saving'
 /** What DocView's save indicator shows: `failed` = dirty after a save error. */
 export type EditorSaveState = SaveState | 'failed'
@@ -104,11 +200,14 @@ export default function DocEditor({
   reviewExtras,
   editable = true,
   onSaveState,
+  restoreSelection = false,
 }: {
   doc: EditableDoc
   /** `docId` names the doc the save landed on: the unmount flush can fire
-   * after the parent has moved to another doc, which must ignore it */
-  onSaved: (epoch: number, docId: string) => void
+   * after the parent has moved to another doc, which must ignore it. `own`
+   * is false when the save landed over someone else's edits (isOwnEpoch):
+   * the doc holds more than this editor shows */
+  onSaved: (epoch: number, docId: string, own: boolean) => void
   onSelectionBlock?: (blockId: string | null) => void
   /** blocks under review → tone; painted as node decorations, no remount */
   reviewMap?: ReviewMap
@@ -118,16 +217,43 @@ export default function DocEditor({
   editable?: boolean
   /** every save-state change, for the doc header's indicator */
   onSaveState?: (s: EditorSaveState) => void
+  /** a remount of the same doc: put the cursor back where it was */
+  restoreSelection?: boolean
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
-  const [saveState, setSaveState] = useState<SaveState>('clean')
-  const [failed, setFailed] = useState(false)
+  const [saveState, setSaveStateRaw] = useState<SaveState>('clean')
+  const [failed, setFailedRaw] = useState(false)
+  // the same, readable synchronously (flush awaits a save and then asks)
+  const stateRef = useRef<SaveState>('clean')
+  const failedRef = useRef(false)
+  const setSaveState = (s: SaveState) => {
+    stateRef.current = s
+    setSaveStateRaw(s)
+  }
+  const setFailed = (f: boolean) => {
+    failedRef.current = f
+    setFailedRaw(f)
+  }
+  /** a save the daemon refused for good: no retry clock until the next edit */
+  const [stopped, setStopped] = useState(false)
+  /** ids this editor stamped whose save has not landed yet, and ids it saw
+   * leave the baseline (deleted, so the store revives them under the same
+   * id): planSave keeps both; any other id outside the baseline is not this
+   * doc's */
+  const ownStamped = useRef(new Set<string>())
+  const seenDeleted = useRef(new Set<string>())
+  /** the request sent whose answer has not come (failed, or the keepalive
+   * as the page went): a retry carries the same request_id, and a later,
+   * different save sends it first and adopts its answer */
+  const pending = useRef<Unsent | null>(null)
   const stateCb = useRef(onSaveState)
   stateCb.current = onSaveState
   useEffect(() => {
     stateCb.current?.(saveState === 'dirty' && failed ? 'failed' : saveState)
   }, [saveState, failed])
+  const docIdRef = useRef(doc.docId)
+  docIdRef.current = doc.docId
   const editableRef = useRef(editable)
   editableRef.current = editable
   // autosave debounce, driven by the editor's update event: every keystroke
@@ -166,6 +292,7 @@ export default function DocEditor({
         // the post-save blockId stamp is our own bookkeeping, not an edit:
         // arming the debounce for it caused a spurious empty save 1.2s later
         if (transaction.getMeta(STAMP_META)) return
+        setStopped(false)
         setSaveState('dirty')
         autosave.current.arm()
       },
@@ -185,6 +312,28 @@ export default function DocEditor({
     [doc.docId],
   )
 
+  const editorRef = useRef(editor)
+  editorRef.current = editor
+  // a remount with fresh content keeps the cursor (clamped to the new doc)
+  useEffect(() => {
+    if (!editor || editor.isDestroyed || !restoreSelection) return
+    const m = selectionMemo.get(doc.docId)
+    selectionMemo.delete(doc.docId)
+    if (!m?.head) return
+    // the block the cursor was in, wherever it is now; gone → no restore
+    // (and no focus): the next keystrokes must never land in another block
+    const head = resolveLoc(editor.state.doc, m.head)
+    if (head == null) return
+    const anchor = (m.anchor && resolveLoc(editor.state.doc, m.anchor)) ?? head
+    try {
+      editor.commands.setTextSelection({ from: anchor, to: head })
+      if (m.focused) editor.commands.focus(undefined, { scrollIntoView: false })
+    } catch {
+      // a position the new doc cannot hold: leave the cursor at the start
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor])
+
   // review marks follow the map from DocView; an empty map clears them
   useEffect(() => {
     if (!editor || editor.isDestroyed) return
@@ -196,81 +345,128 @@ export default function DocEditor({
     if (editor.isEditable !== editable) editor.setEditable(editable, false)
   }, [editor, editable])
 
-  // extract entries (grouping consecutive nodes that share a blockId)
-  const extractEntries = (): Entry[] => (editor ? entriesOf(editor.state.doc) : [])
+  /** Plan a save of what the editor holds now: every new block gets its id
+   * here, before the diff, and the id goes on its node right away. The
+   * insert carries it, and an edit made while the request is in flight moves
+   * the node with its id (never pair inserts with id-less nodes in order —
+   * computeOps groups inserts by parent, so that pairing gave blocks each
+   * other's ids). A failed save keeps them, so its retry sends the same
+   * inserts — under the same request_id. */
+  const prepare = () => {
+    if (!editor) return null
+    const own = new Set([...ownStamped.current, ...seenDeleted.current])
+    const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [], undefined, own)
+    for (const st of stamps) ownStamped.current.add(st.id)
+    if (stamps.length && !editor.isDestroyed) {
+      const tr = editor.state.tr
+      applyStamps(tr, stamps)
+      tr.setMeta('addToHistory', false)
+      tr.setMeta(STAMP_META, true)
+      editor.view.dispatch(tr)
+    }
+    const base = epochRef.current
+    const body = ops.length ? JSON.stringify({ doc_id: doc.docId, base_epoch: base, ops }) : null
+    return { entries, ops, base, body }
+  }
+  /** `plan` as the request to send: the pending one when it is the same
+   * request (a retry keeps its request_id), else a new one */
+  const asRequest = (plan: { entries: Entry[]; ops: Op[]; base: number; body: string }): Unsent => {
+    const r = requestFor(pending.current, plan.body)
+    return r === pending.current ? pending.current : { ...r, entries: plan.entries, ops: plan.ops, base: plan.base }
+  }
+  const send = (r: Unsent) =>
+    api<{ epoch: number }>('/api/propose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...JSON.parse(r.body), request_id: r.id }),
+    })
+  /** a request's answer: what it wrote is the baseline now */
+  const adopt = (r: Unsent, epoch: number) => {
+    if (pending.current === r) pending.current = null
+    const before = baselineRef.current
+    baselineRef.current = rebuildBaseline(before, r.entries, r.ops)
+    const now = new Set(baselineRef.current.map((b) => b.id))
+    // a block this save deleted: an undo (or a paste of its cut) brings it
+    // back under its own id, which the store revives
+    for (const b of before) if (!now.has(b.id)) seenDeleted.current.add(b.id)
+    // landed: these ids are the baseline's now
+    for (const id of now) {
+      ownStamped.current.delete(id)
+      seenDeleted.current.delete(id)
+    }
+    epochRef.current = epoch
+  }
 
   const runSave = async () => {
     if (!editor || !editableRef.current) return
     autosave.current.cancel()
-    // what this save writes; edits landing while the request is in flight
-    // make the doc differ from it, and the editor must stay dirty for them
-    const snapshot = editor.state.doc
-    const entries = extractEntries()
-    const assigned: string[] = []
-    const ops = computeOps(
-      baselineRef.current,
-      entries,
-      () => {
-        const id = crypto.randomUUID()
-        assigned.push(id)
-        return id
-      },
-      undefined,
-      doc.hidden ?? [],
-    )
-    if (ops.length === 0) {
-      setSaveState('clean')
-      return
-    }
-    setSaveState('saving')
+    let plan = prepare()!
     try {
-      const out = await api<{ epoch: number }>('/api/propose', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }),
-      })
-      const editedMeanwhile = !editor.state.doc.eq(snapshot)
-      // stamp fresh ids onto the inserted nodes so the next diff sees them
-      let cursor = 0
-      const inserted = ops
-        .filter((o) => o.kind.op === 'insert')
-        .map((o) => o.kind as unknown as { block_id: string; content: string })
-      if (editor && inserted.length) {
-        const tr = editor.state.tr
-        editor.state.doc.forEach((node, pos) => {
-          if (!node.attrs.blockId && node.content.size > 0 && cursor < inserted.length) {
-            tr.setNodeAttribute(pos, 'blockId', inserted[cursor].block_id)
-            cursor++
-          }
-        })
-        tr.setMeta('addToHistory', false)
-        tr.setMeta(STAMP_META, true)
-        editor.view.dispatch(tr)
+      // an earlier request whose answer never came (a network failure, the
+      // page's keepalive before a bfcache return) may have landed: send it
+      // again under its own request_id first and adopt its answer, so what
+      // follows is planned on the right baseline and epoch (otherwise its
+      // inserts go out again on a stale base and park red)
+      const earlier = pending.current
+      if (earlier && earlier.body !== plan.body) {
+        setSaveState('saving')
+        try {
+          const out = await send(earlier)
+          adopt(earlier, out.epoch)
+          onSaved(out.epoch, doc.docId, isOwnEpoch(earlier.base, out.epoch))
+        } catch (e) {
+          // refused by the daemon: it never applied, and there is nothing to adopt
+          if (!(e instanceof ApiError && e.code)) throw e
+          if (pending.current === earlier) pending.current = null
+        }
+        plan = prepare()!
       }
-      // new baseline = what we just wrote
-      baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
-      epochRef.current = out.epoch
+      // what this save writes; edits landing while the request is in flight
+      // make the doc differ from it, and the editor must stay dirty for them
+      const snapshot = editor.state.doc
+      if (!plan.body) {
+        lastSaveError.current = null
+        setFailed(false)
+        setStopped(false)
+        setSaveState('clean')
+        return
+      }
+      const req = asRequest({ ...plan, body: plan.body })
+      pending.current = req
+      setSaveState('saving')
+      const out = await send(req)
+      const editedMeanwhile = !editor.state.doc.eq(snapshot)
+      adopt(req, out.epoch)
       lastSaveError.current = null
       setFailed(false)
+      setStopped(false)
       // typed during the request? those keystrokes are not in what landed
-      const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
-      lastPlan.current = plan
-      if (plan === 'clean') {
+      const after = afterSave({ editedMeanwhile, mounted: mounted.current })
+      lastPlan.current = after
+      if (after === 'clean') {
         setSaveState('clean')
       } else {
         setSaveState('dirty')
         // 'save-now' (typed then switched doc) is driven by the unmount
         // cleanup below — no debounce or retry clock survives the unmount
-        if (plan === 'rearm') autosave.current.arm()
+        if (after === 'rearm') autosave.current.arm()
       }
-      onSaved(out.epoch, doc.docId)
+      onSaved(out.epoch, doc.docId, isOwnEpoch(req.base, out.epoch))
     } catch (e) {
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
       // failure here was how unsaved edits used to vanish.
       setSaveState('dirty')
       setFailed(true)
-      const msg = saveErrorText(e)
+      // refused for good (doc gone, not writable, invalid ops): retrying
+      // every 5 s forever only repeats the refusal
+      const permanent = isPermanentSaveError(e)
+      if (permanent) setStopped(true)
+      // the daemon answered with a refusal: nothing applied (only an applied
+      // answer is kept for its request_id), so there is no outcome to fetch.
+      // A network failure or a bare 5xx page is the unknown case: it stays
+      if (e instanceof ApiError && e.code) pending.current = null
+      const msg = permanent ? permanentSaveErrorText(e) : saveErrorText(e)
       if (lastSaveError.current !== msg) {
         lastSaveError.current = msg
         notify(msg, 'warn')
@@ -294,13 +490,99 @@ export default function DocEditor({
 
   saveRef.current = save
 
+  /** Save now and wait: true once nothing is unsaved. Keystrokes typed while
+   * a save is in flight need one more, so it tries a few times. */
+  const flush = async (): Promise<boolean> => {
+    if (!editableRef.current) return true
+    for (let i = 0; i < 3; i++) {
+      autosave.current.cancel()
+      if (inFlight.current) await inFlight.current
+      await saveRef.current()
+      if (stateRef.current === 'clean') return true
+      if (failedRef.current) return false
+    }
+    return stateRef.current === 'clean'
+  }
+  const flushRef = useRef(flush)
+  flushRef.current = flush
+
+  // closing or reloading the tab: unsaved typing would be lost with the page
+  // (the debounce is 1.2 s). Ask first where the browser lets a page ask,
+  // and as the page goes, send what is unsaved with a keepalive request that
+  // outlives it. The same request_id as any later save of the same ops, so
+  // if the page stays after all (bfcache) nothing is applied twice. A save in
+  // flight is left to land: re-sending its ops would duplicate them.
+  const keepaliveRef = useRef<() => void>(() => {})
+  keepaliveRef.current = () => {
+    if (stateRef.current === 'clean' || inFlight.current || !editableRef.current || !editor) return
+    const plan = prepare()
+    if (!plan) return
+    // an earlier request with no answer goes as it was (same id): a page
+    // cannot sequence two keepalives, and that one may already have landed.
+    // The trade-off: typing after it is not sent as the page goes (the
+    // beforeunload prompt is its guard); it stays in a bfcache'd page, which
+    // saves it on return after adopting the earlier answer
+    const req = pending.current && pending.current.body !== plan.body ? pending.current : plan.body ? asRequest({ ...plan, body: plan.body }) : null
+    if (!req) return
+    pending.current = req
+    try {
+      void fetch(
+        '/api/propose',
+        withCsrf({
+          method: 'POST',
+          keepalive: true,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...JSON.parse(req.body), request_id: req.id }),
+        }),
+      ).catch(() => {})
+    } catch {
+      // no fetch (or keepalive refused, e.g. too large): the prompt was the guard
+    }
+  }
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (stateRef.current === 'clean' || !editableRef.current) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    const onPageHide = () => keepaliveRef.current()
+    // back from the bfcache: the keepalive's answer was never read. Ask
+    // again under its request_id (the daemon answers what it did) and adopt
+    // that before anything new is planned on a stale epoch
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted && (pending.current || stateRef.current !== 'clean')) void saveRef.current()
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
+    return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
+    }
+  }, [])
+
+  useEffect(
+    () =>
+      registerEditor(doc.docId, {
+        flush: () => flushRef.current(),
+        catchUp: (blocks, epoch) => {
+          if (stateRef.current !== 'clean' || inFlight.current) return false
+          if (!sameBaseline(loadDoc({ docId: doc.docId, epoch, blocks }).baseline, baselineRef.current)) return false
+          epochRef.current = Math.max(epochRef.current, epoch)
+          return true
+        },
+      }),
+    [doc.docId],
+  )
+
   // a failed save leaves the doc dirty with no new keystrokes to re-arm the
   // debounce: retry on a slow clock until it lands (daemon back, …)
   useEffect(() => {
-    if (saveState !== 'dirty') return
+    if (saveState !== 'dirty' || stopped) return
     const t = setInterval(() => saveRef.current(), 5000)
     return () => clearInterval(t)
-  }, [saveState])
+  }, [saveState, stopped])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -310,6 +592,16 @@ export default function DocEditor({
     const pending = autosave.current
     return () => {
       window.removeEventListener('keydown', onKey)
+      try {
+        const ed = editorRef.current
+        if (ed) {
+          const sel = ed.state.selection
+          const d = ed.state.doc
+          selectionMemo.set(docIdRef.current, { anchor: locate(d, sel.anchor), head: locate(d, sel.head), focused: ed.isFocused })
+        }
+      } catch {
+        // the editor is already gone: nothing to remember
+      }
       // unmount/navigation: land whatever is pending now (the save reports
       // its own docId, so a parent that has moved on ignores the result)
       pending.cancel()
@@ -364,7 +656,7 @@ export function loadDoc(doc: EditableDoc): { nodes: PMNode[]; baseline: Baseline
 
 /** The editor doc's top-level entries for the diff (consecutive nodes
  * sharing a blockId are one block; empty unsaved paragraphs are none). */
-export function entriesOf(doc: PMNode): Entry[] {
+export function entriesOf(doc: PMNode, positions?: number[]): Entry[] {
   const entries: Entry[] = []
   let run: { id: string; nodes: PMNode[] } | null = null
   const flushRun = () => {
@@ -377,7 +669,7 @@ export function entriesOf(doc: PMNode): Entry[] {
       run = null
     }
   }
-  doc.forEach((node) => {
+  doc.forEach((node, pos) => {
     if (node.type.name === 'paragraph' && node.content.size === 0 && !node.attrs.blockId) {
       return // empty unsaved paragraphs are not blocks
     }
@@ -387,6 +679,8 @@ export function entriesOf(doc: PMNode): Entry[] {
       return
     }
     flushRun()
+    // where the entry's first node sits (entries and positions stay parallel)
+    positions?.push(pos)
     if (id) run = { id, nodes: [node] }
     else
       entries.push({
@@ -399,6 +693,83 @@ export function entriesOf(doc: PMNode): Entry[] {
   return entries
 }
 
+/** Two baselines hold the same blocks in the same places. */
+export function sameBaseline(a: BaselineBlock[], b: BaselineBlock[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((x, i) => x.id === b[i].id && x.content === b[i].content && x.parent === b[i].parent && x.order_key === b[i].order_key)
+  )
+}
+
+/** A new block's id and the node it belongs on: `pos` is where that node
+ * started in the doc the save was planned from. */
+export interface Stamp {
+  pos: number
+  id: string
+  type: string
+  /** the id the node carried that is not this doc's (pasted from another
+   * doc, or a block this editor saw deleted): replaced on every node of it */
+  replaces?: string | null
+}
+
+/** What one save writes: the entries (every new one already given its id),
+ * the ops, and the stamps that put those ids on their nodes once it lands.
+ * An entry keeps its id when the baseline holds it, or when `own` does: ids
+ * this editor stamped for a save not yet landed, and ids it saw deleted from
+ * this doc (an undo of a saved delete, a cut then autosave then paste): the
+ * store revives a deleted block of the same doc under its id, links and
+ * comment anchors included. Any other id is not this doc's (a paste from
+ * another doc, where the insert is refused: "already exists", or "a
+ * tombstone in another doc"), nor is a second run of one id: those get a
+ * fresh one. */
+export function planSave(
+  doc: PMNode,
+  baseline: BaselineBlock[],
+  hidden: HiddenBlock[],
+  newId: () => string = () => crypto.randomUUID(),
+  own: ReadonlySet<string> = new Set(),
+): { entries: Entry[]; ops: Op[]; stamps: Stamp[] } {
+  const positions: number[] = []
+  const stamps: Stamp[] = []
+  const known = new Set(baseline.map((b) => b.id))
+  const seen = new Set<string>()
+  const entries = entriesOf(doc, positions).map((e, i) => {
+    if (e.id && !seen.has(e.id) && (known.has(e.id) || own.has(e.id))) {
+      seen.add(e.id)
+      return e
+    }
+    const id = newId()
+    stamps.push({ pos: positions[i], id, type: doc.nodeAt(positions[i])!.type.name, replaces: e.id })
+    return { ...e, id }
+  })
+  const ops = computeOps(baseline, entries, newId, undefined, hidden)
+  return { entries, ops, stamps }
+}
+
+/** Put the new ids on their nodes, in the doc the save was planned from (a
+ * position that no longer holds an id-less top-level node of that type is
+ * left alone). True when anything was set. */
+export function applyStamps(tr: Transaction, stamps: Stamp[]): boolean {
+  let any = false
+  for (const s of stamps) {
+    if (s.pos >= tr.doc.content.size || tr.doc.resolve(s.pos).depth !== 0) continue
+    const node = tr.doc.nodeAt(s.pos)
+    if (!node || node.type.name !== s.type || (node.attrs.blockId ?? null) !== (s.replaces ?? null)) continue
+    tr.setNodeAttribute(s.pos, 'blockId', s.id)
+    any = true
+    // a replaced id: the rest of its run (one block over several nodes) too
+    if (s.replaces) {
+      for (let p = s.pos + node.nodeSize; p < tr.doc.content.size; ) {
+        const next = tr.doc.nodeAt(p)
+        if (!next || next.attrs.blockId !== s.replaces) break
+        tr.setNodeAttribute(p, 'blockId', s.id)
+        p += next.nodeSize
+      }
+    }
+  }
+  return any
+}
+
 /** After a successful save the written entries ARE the new baseline. */
 export function rebuildBaseline(
   old: BaselineBlock[],
@@ -407,6 +778,13 @@ export function rebuildBaseline(
 ): BaselineBlock[] {
   const oldById = new Map(old.map((b) => [b.id, b]))
   const inserts = ops.filter((o) => o.kind.op === 'insert')
+  type Ins = { block_id: string; parent_id: string | null; order_key: string }
+  // an entry that carries its insert's id takes that insert's place, whatever
+  // order computeOps emitted the inserts in (it groups them by parent)
+  const insertById = new Map(inserts.map((o) => [o.kind.block_id as string, o.kind as unknown as Ins]))
+  const claimed = new Set<string>()
+  for (const e of entries) if (e.id && insertById.has(e.id)) claimed.add(e.id)
+  const unclaimed = inserts.filter((o) => !claimed.has(o.kind.block_id as string))
   const moves = new Map(
     ops
       .filter((o) => o.kind.op === 'move')
@@ -415,7 +793,10 @@ export function rebuildBaseline(
   let insertCursor = 0
   const out: BaselineBlock[] = []
   for (const e of entries) {
-    if (e.id) {
+    const ins = e.id ? insertById.get(e.id) : undefined
+    if (ins && !oldById.has(e.id!)) {
+      out.push({ id: ins.block_id, content: e.content, parent: ins.parent_id, order_key: ins.order_key })
+    } else if (e.id) {
       const prev = oldById.get(e.id)
       const mv = moves.get(e.id)
       out.push({
@@ -425,9 +806,9 @@ export function rebuildBaseline(
         order_key: mv ? mv.new_order_key : (prev?.order_key ?? 'i'),
       })
     } else {
-      const ins = inserts[insertCursor++]?.kind as unknown as
-        | { block_id: string; parent_id: string | null; order_key: string }
-        | undefined
+      // id-less entries (callers that leave the ids to computeOps) pair with
+      // the remaining inserts in order: right only when those share a parent
+      const ins = unclaimed[insertCursor++]?.kind as unknown as Ins | undefined
       if (ins)
         out.push({ id: ins.block_id, content: e.content, parent: ins.parent_id, order_key: ins.order_key })
     }
