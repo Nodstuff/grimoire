@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from 'react-dom'
 import DocEditor, { parser, type EditorSaveState } from '../editor/DocEditor'
 import { splitTree } from '../editor/splitTree'
-import { editorFor } from '../editor/registry'
+import { editorFor, flushDoc } from '../editor/registry'
 import LivingChip from '../LivingChip'
 import EreaderChip from '../EreaderChip'
 import { EREADER_EVENT, loadEreaderStatus, syncDiagramImages, useEreaderStatus } from '../ereader'
@@ -555,25 +555,20 @@ export default function DocView({
   }, [dataVersion, loadReview, loadHistory])
 
   // after a resolve: content may have moved (yellow decline reverts, red
-  // accept applies) — refetch, remount the editor if the epoch moved
+  // accept applies) — land any unsaved typing first, then refetch and
+  // remount the editor if the epoch moved. Remounting over unsaved typing hid
+  // the last keystrokes and the unmount flush then parked them red: a dirty
+  // editor reloads once clean instead (adoptTree)
   const afterResolve = useCallback(() => {
     loadReview()
     loadHistory()
     const g = gen.current
-    api<DocTree>(`/api/doc/${docId}`)
-      .then((next) => {
-        if (!fresh(g)) return
-        const cur = treeRef.current
-        if (!cur || next.doc.current_epoch !== cur.doc.current_epoch) {
-          ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
-          editorEpoch.current = next.doc.current_epoch
-          behind.current = false
-          setEditorGen((g) => g + 1)
-        }
-        setTree(next)
-      })
-      .catch(() => {})
-  }, [docId, loadReview, loadHistory, fresh])
+    void flushDoc(docId).then(() =>
+      api<DocTree>(`/api/doc/${docId}`)
+        .then((next) => fresh(g) && adoptTree(next, true))
+        .catch(() => {}),
+    )
+  }, [docId, loadReview, loadHistory, fresh, adoptTree])
 
   // live refresh: when the store changed and this doc moved past what the
   // editor shows (its own saves included), reload it and remount the editor
@@ -742,6 +737,8 @@ export default function DocView({
     async (annotationId: string, decision: 'accept' | 'decline') => {
       if (resolving) return
       setResolving(true)
+      // unsaved typing lands first, on the doc as it is before the resolve
+      await flushDoc(docId)
       try {
         await api('/api/resolve', {
           method: 'POST',
@@ -754,7 +751,7 @@ export default function DocView({
       setResolving(false)
       afterResolve()
     },
-    [afterResolve, resolving],
+    [afterResolve, resolving, docId],
   )
 
   /* ---------- the inspector ---------- */

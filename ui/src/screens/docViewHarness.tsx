@@ -5,13 +5,17 @@ import { createRoot } from 'react-dom/client'
 import { vi } from 'vitest'
 import type { Editor } from '@tiptap/core'
 import DocView from './DocView'
-import type { BlockNode, DocTree } from '../types'
+import type { BlockNode, DocTree, QueueRow } from '../types'
+import type { Panel } from './DocView'
 import { block } from '../editor/editorHarness'
 
 export interface FakeServer {
   tree: DocTree
   /** answer to a POST /api/propose (default: next epoch, applied) */
   propose: (body: Record<string, unknown>) => unknown
+  /** answer to a POST /api/resolve (default: ok) */
+  resolve: (body: Record<string, unknown>) => unknown
+  review: QueueRow[]
   calls: { path: string; method: string; body: Record<string, unknown> | null }[]
 }
 
@@ -27,6 +31,8 @@ export function fakeServer(tree: DocTree): FakeServer {
   const server: FakeServer = {
     tree,
     propose: (body) => ({ doc_id: 'd', epoch: (body.base_epoch as number) + 1, verdicts: [] }),
+    resolve: () => ({ ok: true }),
+    review: [],
     calls: [],
   }
   vi.stubGlobal(
@@ -38,6 +44,8 @@ export function fakeServer(tree: DocTree): FakeServer {
       let r: unknown = []
       if (path === '/api/doc/d') r = server.tree
       else if (path === '/api/propose') r = server.propose(body)
+      else if (path === '/api/resolve') r = server.resolve(body)
+      else if (path === '/api/doc/d/review') r = server.review
       else if (path === '/api/profile') r = { principal_id: 'me', name: 'Me', confirmed: true }
       else if (path === '/api/workspaces') r = { workspaces: [] }
       else if (method !== 'GET') r = { ok: true }
@@ -47,14 +55,14 @@ export function fakeServer(tree: DocTree): FakeServer {
   return server
 }
 
-export async function mountDocView(dataVersion = 0) {
+export async function mountDocView(dataVersion = 0, panel: Panel = 'closed') {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const root = createRoot(el)
   const render = async (dv: number) =>
     act(async () => {
       root.render(
-        <DocView docId="d" onOpenDoc={() => {}} docs={[]} dataVersion={dv} panel="closed" setPanel={() => {}} />,
+        <DocView docId="d" onOpenDoc={() => {}} docs={[]} dataVersion={dv} panel={panel} setPanel={() => {}} />,
       )
     })
   await render(dataVersion)
@@ -67,5 +75,28 @@ export async function mountDocView(dataVersion = 0) {
       await act(async () => root.unmount())
       el.remove()
     },
+  }
+}
+
+/** a yellow (applied, flagged) replace of `target` by an agent */
+export function yellowReplace(id: string, target: string, before: string, after: string): QueueRow {
+  return {
+    item: {
+      annotation: { id, doc_id: 'd', op_id: `op-${id}`, kind: 'review', status: 'open' },
+      op: {
+        id: `op-${id}`,
+        kind: { op: 'replace', target, content: after },
+        principal: 'agent',
+        base_epoch: 4,
+        epoch_applied: 5,
+        verdict: 'yellow',
+        confidence: 0.6,
+        prior: { ...block(target, before), epoch: 4 },
+        source_refs: [],
+      },
+    },
+    doc_title: 'T',
+    proposer: 'claude:test',
+    current_content: after,
   }
 }
