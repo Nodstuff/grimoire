@@ -449,6 +449,8 @@ export default function DocView({
   // someone else's edit landed that the editor does not show (a save rebased
   // over it, or a newer tree arrived while typing): reload once clean
   const behind = useRef(false)
+  // the byline's version: our own saves move it without a tree refetch
+  const [savedEpoch, setSavedEpoch] = useState(0)
   const [editorGen, setEditorGen] = useState(0)
   const [saveState, setSaveState] = useState<EditorSaveState>('clean')
   const saveStateRef = useRef<EditorSaveState>('clean')
@@ -533,6 +535,7 @@ export default function DocView({
     editorEpoch.current = 0
     lastSaved.current = 0
     behind.current = false
+    setSavedEpoch(0)
     loadTree()
     loadReview()
     loadHistory()
@@ -945,7 +948,7 @@ export default function DocView({
             </button>
           </div>
           <DocTitle doc={doc} onRenamed={loadTree} readOnly={readOnly} />
-          <Byline rows={history} epoch={doc.current_epoch} onHistory={() => openTab('history')} />
+          <Byline rows={history} epoch={Math.max(doc.current_epoch, savedEpoch)} onHistory={() => openTab('history')} />
           {removedCanvases > 0 && (
             <div className="dv-notice">
               <Icon name="info" size={15} />
@@ -965,6 +968,7 @@ export default function DocView({
                 // the unmount flush of a PREVIOUS doc's editor reports its own id
                 if (savedDocId !== docId) return
                 lastSaved.current = Math.max(lastSaved.current, e)
+                setSavedEpoch((v) => Math.max(v, e))
                 // a save rebased over someone else's edit: that epoch is not
                 // ours alone, and the editor reloads once clean to show it
                 if (own) ownEpoch.current = Math.max(ownEpoch.current, e)
