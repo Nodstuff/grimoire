@@ -428,7 +428,15 @@ pub(crate) fn check_space_change(conn: &Connection, scope: Scope, from: Space, t
 /// Every user's visible doc set (System work: computed for all users).
 pub(crate) type AccessSnapshot = Vec<(Uuid, HashSet<String>)>;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: how many access snapshots this thread has taken.
+    pub(crate) static SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn access_snapshot(conn: &Connection) -> Result<AccessSnapshot> {
+    #[cfg(test)]
+    SNAPSHOTS.with(|n| n.set(n.get() + 1));
     let users: Vec<String> = {
         let mut st = conn.prepare_cached("SELECT id FROM auth_users ORDER BY created_at, id")?;
         st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?

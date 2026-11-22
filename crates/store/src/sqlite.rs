@@ -2981,7 +2981,6 @@ impl BlockStore for SqliteStore {
                 "proposals in a shared workspace are resolved by its members, not by an agent".into(),
             ));
         }
-        let before = tenancy::access_snapshot(&tx)?;
         let kind = parse_annotation_kind(&kind_s)?;
         if parse_annotation_status(&status_s)? != AnnotationStatus::Open {
             return Err(StoreError::InvalidOp(format!(
@@ -2995,6 +2994,11 @@ impl BlockStore for SqliteStore {
             row_to_op,
         )?;
         let op = build_op(raw_op)?;
+        // who sees what changes only through a doc op (a move, a delete,
+        // its restore); a block op's accept or decline touches blocks of one
+        // doc, so the every-user visibility snapshot is skipped for it
+        // (code review 2026-11-22, item 18)
+        let before = if op.kind.is_doc_op() { Some(tenancy::access_snapshot(&tx)?) } else { None };
 
         // the trust invariant (§3.4): proposer ≠ approver, enforced at the
         // gate — for AGENT principals, whose autonomy it bounds. The
@@ -3188,7 +3192,9 @@ impl BlockStore for SqliteStore {
                 )?;
             }
         }
-        tenancy::journal_access_diff(&tx, before)?;
+        if let Some(before) = before {
+            tenancy::journal_access_diff(&tx, before)?;
+        }
         tx.commit()?;
         Ok(receipt)
     }
@@ -4982,6 +4988,41 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// Resolving a block op takes no every-user access snapshot (it cannot
+    /// change who sees what); resolving a doc op still does (code review
+    /// 2026-11-22, item 18). Correctness of the journal is covered by the
+    /// tenancy tests.
+    #[test]
+    fn a_block_op_resolve_skips_the_access_snapshot() {
+        use crate::{BlockStore, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let bot = s.create_principal(PrincipalKind::Agent, "claude:t", None).unwrap().id;
+        let d = s.create_doc("D", None, tom).unwrap().id;
+        let ins = OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(),
+                parent_id: None,
+                order_key: String::new(),
+                block_type: BlockType::Paragraph,
+                content: "x".into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        s.propose_reviewed(d, 0, bot, vec![ins]).unwrap();
+        let ann = s.review_queue(Some(d)).unwrap()[0].annotation.id;
+        let n0 = tenancy::SNAPSHOTS.with(|n| n.get());
+        s.resolve(ann, tom, ReviewDecision::Accept).unwrap();
+        assert_eq!(tenancy::SNAPSHOTS.with(|n| n.get()), n0, "a block op: no snapshot");
+        s.propose_doc_op(d, bot, OpKind::RenameDoc { title: "E".into(), from_title: String::new() }, vec![]).unwrap();
+        let ann = s.review_queue(Some(d)).unwrap()[0].annotation.id;
+        let n1 = tenancy::SNAPSHOTS.with(|n| n.get());
+        s.resolve(ann, tom, ReviewDecision::Decline).unwrap();
+        assert_eq!(tenancy::SNAPSHOTS.with(|n| n.get()), n1 + 1, "a doc op: one snapshot");
+        assert_eq!(s.get_doc(d).unwrap().title, "D");
     }
 
     /// A panic inside `read_snapshot` rolls its transaction back: the
