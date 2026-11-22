@@ -130,7 +130,7 @@ private struct ListBlock: View {
                     .docFont(.body)
                     .foregroundStyle(checked ? Color.lapis.green : Color.lapis.ink3)
                     .frame(width: 28, height: 28)
-                    .contentShape(.rect)
+                    .tapArea(.checkbox)
             }
             .buttonStyle(.plain)
             .disabled(toggle.action == nil)

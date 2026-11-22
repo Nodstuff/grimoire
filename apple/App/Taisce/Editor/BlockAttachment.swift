@@ -109,6 +109,7 @@ struct AttachmentContent: View {
                             .font(.caption.weight(.semibold))
                             .padding(6)
                             .background(.thinMaterial, in: .circle)
+                            .tapArea(.editSource)
                     }
                     .buttonStyle(.plain)
                     .padding(6)

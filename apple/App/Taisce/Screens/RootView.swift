@@ -465,7 +465,7 @@ struct PadSidebar: View {
                             if model.currentAccess.canCreate {
                                 Button { router.newFolder(in: nil) } label: {
                                     Image(systemName: "folder.badge.plus").foregroundStyle(Color.lapis.ink3)
-                                        .frame(width: 30, height: 30).contentShape(.rect)
+                                        .frame(width: 30, height: 30).tapArea(.newFolder)
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("New folder")

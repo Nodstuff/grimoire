@@ -102,3 +102,39 @@ private struct LapisShadowModifier: ViewModifier {
         }
     }
 }
+
+/// A control drawn smaller than a finger (a 28 pt checkbox, the pencil on
+/// a diagram) still takes a 44 pt tap: its hit shape reaches past what is
+/// drawn, and nothing drawn moves or grows (the layout box stays the drawn
+/// size). Where neighbours sit closer than 44 pt (list checkboxes, 8 pt
+/// apart) the reach is capped so two targets never overlap.
+struct TapArea: Equatable {
+    /// what is drawn
+    var drawn: CGSize
+    /// the hit area wanted around it
+    var target: CGSize
+
+    /// how far the hit shape reaches past each side
+    var insets: (h: CGFloat, v: CGFloat) {
+        (max(0, (target.width - drawn.width) / 2), max(0, (target.height - drawn.height) / 2))
+    }
+
+    /// a doc checkbox: 28 pt in a list whose rows are 8 pt apart, so 44 wide
+    /// and as tall as the row pitch (28 + 8) without reaching a neighbour
+    static let checkbox = TapArea(drawn: CGSize(width: 28, height: 28), target: CGSize(width: Lapis.Layout.minTarget, height: 36))
+    /// the pencil on a block shown as an attachment (a caption glyph in 6 pt of padding)
+    static let editSource = TapArea(drawn: CGSize(width: 26, height: 26), target: CGSize(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget))
+    /// the sidebar's New folder (a 30 pt square)
+    static let newFolder = TapArea(drawn: CGSize(width: 30, height: 30), target: CGSize(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget))
+}
+
+extension View {
+    /// Hit-testable across `area.target` around the view; drawn and laid
+    /// out as before.
+    func tapArea(_ area: TapArea) -> some View {
+        let (h, v) = area.insets
+        return padding(.horizontal, h).padding(.vertical, v)
+            .contentShape(.rect)
+            .padding(.horizontal, -h).padding(.vertical, -v)
+    }
+}
