@@ -357,10 +357,11 @@ impl SqliteStore {
     /// `fabric_turn_put`, answering the new turn's `seq` (None: a replay).
     pub fn fabric_turn_put_seq(&mut self, runtime: Uuid, t: &FabricTurn) -> Result<Option<i64>> {
         let owner = self.fabric_runtime(runtime)?.user_id;
-        let n = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
             &format!(
                 "INSERT INTO fabric_turns ({TURN_COLS}, seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM fabric_turns))
+                     (SELECT next FROM fabric_turn_seq WHERE id = 1))
                  ON CONFLICT (runtime_id, session_id, turn_id) DO NOTHING"
             ),
             params![
@@ -388,11 +389,14 @@ impl SqliteStore {
         if n == 0 {
             return Ok(None);
         }
-        Ok(Some(self.conn.query_row(
+        tx.execute("UPDATE fabric_turn_seq SET next = next + 1 WHERE id = 1", [])?;
+        let seq = tx.query_row(
             "SELECT seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND turn_id = ?3",
             params![runtime.to_string(), t.session_id.to_string(), t.turn_id],
             |r| r.get(0),
-        )?))
+        )?;
+        tx.commit()?;
+        Ok(Some(seq))
     }
 
     /// One session's turns, newest first, ended before `before` when given.
@@ -1141,12 +1145,9 @@ impl SqliteStore {
             let rows = st.query_map([now], pairing_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        // the newest-stored turn stays (even if a replay made it old), so
-        // `seq` never goes back and is never handed out twice
-        tx.execute(
-            "DELETE FROM fabric_turns WHERE ended < ?1 AND seq < (SELECT COALESCE(MAX(seq), 0) FROM fabric_turns)",
-            [cutoff],
-        )?;
+        // seq comes from fabric_turn_seq, which only goes up: the prune can
+        // take any turn without a seq being handed out again
+        tx.execute("DELETE FROM fabric_turns WHERE ended < ?1", [cutoff])?;
         tx.execute("DELETE FROM fabric_orders WHERE updated_at < ?1", [cutoff])?;
         tx.execute("DELETE FROM fabric_attention WHERE updated_at < ?1", [cutoff])?;
         tx.execute("DELETE FROM fabric_pairings WHERE created_at < ?1", [now - PAIRING_ROW_RETENTION])?;

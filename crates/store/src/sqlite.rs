@@ -94,6 +94,7 @@ impl SqliteStore {
         // v17: the turns' insertion sequence (fabric.sql)
         add_column_if_missing(&conn, "fabric_turns", "seq", "INTEGER")?;
         backfill(&conn)?;
+        sequence_turns(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
 
@@ -618,6 +619,32 @@ fn backfill(conn: &Connection) -> Result<()> {
         tx.execute_batch("CREATE INDEX IF NOT EXISTS ops_by_target ON ops (target_block);")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Every open: lift the turn counter past every stored `seq`, and number
+/// the turns stored without one (by a binary from before v17, after a
+/// rollback) in the order they were stored. Cheap when there are none (the
+/// seq index finds NULLs).
+fn sequence_turns(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE fabric_turn_seq SET next = MAX(next, (SELECT COALESCE(MAX(seq), 0) + 1 FROM fabric_turns)) WHERE id = 1",
+        [],
+    )?;
+    let bare: Vec<i64> = {
+        let mut st = tx.prepare("SELECT rowid FROM fabric_turns WHERE seq IS NULL ORDER BY rowid")?;
+        st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    if !bare.is_empty() {
+        let mut next: i64 = tx.query_row("SELECT next FROM fabric_turn_seq WHERE id = 1", [], |r| r.get(0))?;
+        for rowid in bare {
+            tx.execute("UPDATE fabric_turns SET seq = ?1 WHERE rowid = ?2", params![next, rowid])?;
+            next += 1;
+        }
+        tx.execute("UPDATE fabric_turn_seq SET next = ?1 WHERE id = 1", [next])?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -5101,6 +5128,72 @@ mod tests {
         assert!(s.conn.is_autocommit(), "no transaction left open");
         s.create_doc("after", None, p).unwrap();
         assert_eq!(s.read_snapshot(|s| s.list_docs().unwrap().len()).unwrap(), 1);
+    }
+
+    /// Review of this branch, items 4 and 5: a turn an older binary stored
+    /// without a seq is numbered at the next open (after every other), and a
+    /// seq is never handed out twice, even once the turns that held the
+    /// highest are deleted with their runtime.
+    #[test]
+    fn turn_seqs_only_go_up_and_bare_turns_are_numbered_at_open() {
+        use crate::{BlockStore, PrincipalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let (rt, sid, first, tom) = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let tom = s.auth_ensure_owner(p, "tom", 1).unwrap().id;
+            let rt = s.fabric_runtime_create(tom, "mbp", "h1", 1).unwrap().id;
+            let sid = Uuid::now_v7();
+            let t = crate::fabric::FabricTurn {
+                runtime_id: rt,
+                session_id: sid,
+                user_id: tom,
+                turn_id: "t1".into(),
+                address: String::new(),
+                project: String::new(),
+                prompt: String::new(),
+                reply: String::new(),
+                text_off: false,
+                tool_count: 0,
+                outcome: "{}".into(),
+                started: 1,
+                ended: 2,
+                truncated: false,
+                context_used_pct: None,
+                end_kind: "clean".into(),
+                source: "mac".into(),
+                order_id: None,
+                created_at: 2,
+                seq: 0,
+            };
+            let first = s.fabric_turn_put_seq(rt, &t).unwrap().unwrap();
+            // an older binary's insert: no seq
+            s.conn
+                .execute(
+                    "INSERT INTO fabric_turns (runtime_id, session_id, turn_id, user_id, started, ended, created_at)
+                     VALUES (?1, ?2, 'old-binary', ?3, 0, 1, 1)",
+                    params![rt.to_string(), sid.to_string(), tom.to_string()],
+                )
+                .unwrap();
+            (rt, sid, first, tom)
+        };
+        let mut s = SqliteStore::open(&path).unwrap();
+        let got = s.fabric_turns_after_seq(rt, sid, first, 10).unwrap();
+        assert_eq!(got.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(), ["old-binary"], "numbered after t1");
+        let bare = got[0].seq;
+        assert!(bare > first);
+        // the runtime (and its turns) go; a new runtime's turn still gets a
+        // higher seq than any handed out
+        s.conn.execute("DELETE FROM fabric_runtimes WHERE id = ?1", [rt.to_string()]).unwrap();
+        let rt2 = s.fabric_runtime_create(tom, "air", "h2", 1).unwrap().id;
+        let t = crate::fabric::FabricTurn { runtime_id: rt2, turn_id: "t2".into(), ..got[0].clone() };
+        let next = s.fabric_turn_put_seq(rt2, &t).unwrap().unwrap();
+        assert!(next > bare, "{next} > {bare}");
+        drop(s);
+        let mut s = SqliteStore::open(&path).unwrap();
+        let t = crate::fabric::FabricTurn { runtime_id: rt2, turn_id: "t3".into(), ..got[0].clone() };
+        assert!(s.fabric_turn_put_seq(rt2, &t).unwrap().unwrap() > next, "across a reopen too");
     }
 
     /// v18: an older database gets `ops_by_target`, and the hot lookups by

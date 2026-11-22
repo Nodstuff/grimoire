@@ -120,14 +120,25 @@ CREATE TABLE IF NOT EXISTS fabric_turns (
     source           TEXT NOT NULL DEFAULT 'unknown',
     order_id         TEXT,
     created_at       INTEGER NOT NULL,
-    -- the insertion sequence (MAX + 1 at insert; v17 numbered older rows in
-    -- rowid order): a cursor that a replayed turn's past `ended` cannot dodge.
+    -- the insertion sequence (from fabric_turn_seq at insert; v17 numbered
+    -- older rows in rowid order): a cursor that a replayed turn's past
+    -- `ended` cannot dodge.
     -- Its index is created by the v17 migration (sqlite.rs), after the
     -- column exists on an older database.
     seq              INTEGER,
     PRIMARY KEY (runtime_id, session_id, turn_id)
 );
 CREATE INDEX IF NOT EXISTS fabric_turns_user_ended ON fabric_turns (user_id, ended);
+
+-- The next turn `seq`: a counter that only goes up, so a seq is never
+-- handed out twice even after the turns holding the highest ones are gone
+-- (a runtime or person deleted, the prune). Every open lifts it past the
+-- turns' MAX(seq) and numbers turns an older binary stored without one.
+CREATE TABLE IF NOT EXISTS fabric_turn_seq (
+    id   INTEGER PRIMARY KEY CHECK (id = 1),
+    next INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO fabric_turn_seq (id, next) VALUES (1, 1);
 
 -- An attention item: raised by a runtime (signed request) or by the hub
 -- (a wake offer, a paused pair, an ask waiting). Open while cleared_at is
