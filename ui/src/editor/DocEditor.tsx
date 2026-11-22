@@ -16,11 +16,11 @@ import type { Node as PMNode } from '@tiptap/pm/model'
 import type { Transaction } from '@tiptap/pm/state'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
-import { saveErrorText } from '../hints'
+import { isPermanentSaveError, permanentSaveErrorText, saveErrorText } from '../hints'
 import { BaselineBlock, Entry, HiddenBlock, Op, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
-import { AfterSave, afterSave } from './savePlan'
+import { AfterSave, PendingRequest, afterSave, requestFor } from './savePlan'
 import './editor.css'
 
 /** transaction meta marking DocEditor's own post-save blockId stamping, so
@@ -124,6 +124,10 @@ export default function DocEditor({
   selCb.current = onSelectionBlock
   const [saveState, setSaveState] = useState<SaveState>('clean')
   const [failed, setFailed] = useState(false)
+  /** a save the daemon refused for good: no retry clock until the next edit */
+  const [stopped, setStopped] = useState(false)
+  /** the request being retried, so a retry carries the same request_id */
+  const pending = useRef<PendingRequest | null>(null)
   const stateCb = useRef(onSaveState)
   stateCb.current = onSaveState
   useEffect(() => {
@@ -167,6 +171,7 @@ export default function DocEditor({
         // the post-save blockId stamp is our own bookkeeping, not an edit:
         // arming the debounce for it caused a spurious empty save 1.2s later
         if (transaction.getMeta(STAMP_META)) return
+        setStopped(false)
         setSaveState('dirty')
         autosave.current.arm()
       },
@@ -222,18 +227,22 @@ export default function DocEditor({
       return
     }
     setSaveState('saving')
+    const req = requestFor(pending.current, JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }))
+    pending.current = req
     try {
       const out = await api<{ epoch: number }>('/api/propose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }),
+        body: JSON.stringify({ ...JSON.parse(req.body), request_id: req.id }),
       })
+      pending.current = null
       const editedMeanwhile = !editor.state.doc.eq(snapshot)
       // new baseline = what we just wrote
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
       epochRef.current = out.epoch
       lastSaveError.current = null
       setFailed(false)
+      setStopped(false)
       // typed during the request? those keystrokes are not in what landed
       const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
       lastPlan.current = plan
@@ -252,7 +261,11 @@ export default function DocEditor({
       // failure here was how unsaved edits used to vanish.
       setSaveState('dirty')
       setFailed(true)
-      const msg = saveErrorText(e)
+      // refused for good (doc gone, not writable, invalid ops): retrying
+      // every 5 s forever only repeats the refusal
+      const permanent = isPermanentSaveError(e)
+      if (permanent) setStopped(true)
+      const msg = permanent ? permanentSaveErrorText(e) : saveErrorText(e)
       if (lastSaveError.current !== msg) {
         lastSaveError.current = msg
         notify(msg, 'warn')
@@ -279,10 +292,10 @@ export default function DocEditor({
   // a failed save leaves the doc dirty with no new keystrokes to re-arm the
   // debounce: retry on a slow clock until it lands (daemon back, …)
   useEffect(() => {
-    if (saveState !== 'dirty') return
+    if (saveState !== 'dirty' || stopped) return
     const t = setInterval(() => saveRef.current(), 5000)
     return () => clearInterval(t)
-  }, [saveState])
+  }, [saveState, stopped])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
