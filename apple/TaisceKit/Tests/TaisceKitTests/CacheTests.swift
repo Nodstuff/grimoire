@@ -53,6 +53,31 @@ import Testing
         #expect(try await cache.blocks(of: "d1").isEmpty)
     }
 
+    /// Review 2026-11-22 #1: a refresh and the sync loop can fetch one doc
+    /// at once; the slower, older answer must not roll the body back.
+    @Test func anOlderBodyNeverReplacesANewerOne() async throws {
+        let cache = try Cache.inMemory()
+        let newer = try JSONDecoder().decode(DocTree.self, from: Data(Fixture.docTree("d1", title: "Doc", epoch: 5, roots: """
+        {"block":\(Fixture.block("new", doc: "d1", content: "newer words")),"children":[]}
+        """).utf8))
+        try await cache.storeDoc(newer)
+        try await cache.storeDoc(tree("d1", title: "Old title", epoch: 3))
+        let d = try #require(try await cache.doc("d1"))
+        #expect(d.bodyEpoch == 5 && d.currentEpoch == 5 && d.title == "Doc" && !d.isBodyStale)
+        #expect(try await cache.blocks(of: "d1").map(\.id) == ["new"])
+        #expect(try await cache.searchBlocks("brav").isEmpty)
+
+        // the same epoch again still writes (a refetch after a reset)
+        try await cache.storeDoc(tree("d1", epoch: 5))
+        #expect(try await cache.blocks(of: "d1").map(\.id) == ["d1h1", "d1p1", "d1p2", "d1h2"])
+
+        // a body fetched before a newer epoch was noted keeps that epoch as current
+        try await cache.noteEpoch("d1", epoch: 9)
+        try await cache.storeDoc(tree("d1", epoch: 7))
+        let s = try #require(try await cache.doc("d1"))
+        #expect(s.bodyEpoch == 7 && s.currentEpoch == 9 && s.isBodyStale)
+    }
+
     @Test func fullTextSearchFollowsUpserts() async throws {
         let cache = try Cache.inMemory()
         try await cache.storeDoc(tree("d1"))

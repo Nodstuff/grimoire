@@ -318,6 +318,10 @@ public final class Cache: Sendable {
     // MARK: bodies
 
     /// Upsert the doc row and replace its blocks with the fetched tree.
+    /// A fetch older than the body already held writes nothing: two fetches
+    /// of one doc can interleave (a refresh and the sync loop), and the
+    /// slower, older answer must not roll the body or its epoch back.
+    /// `current_epoch` only moves forward here.
     public func storeDoc(_ tree: DocTree) async throws {
         let flat = tree.flattened().filter { !$0.block.deleted }
         // every workspace has its own To-do doc, at any depth
@@ -327,6 +331,8 @@ public final class Cache: Sendable {
         try await db.write { db in
             var rec = DocRecord(tree.doc, bodyEpoch: tree.doc.currentEpoch)
             if let existing = try DocRecord.fetchOne(db, key: tree.doc.id) {
+                if let held = existing.bodyEpoch, held > tree.doc.currentEpoch { return }
+                rec.currentEpoch = max(existing.currentEpoch, tree.doc.currentEpoch)
                 // /api/doc/{id}'s `doc` lacks the tree decorations; keep ours
                 rec.isCanvas = existing.isCanvas
                 rec.isShared = existing.isShared
