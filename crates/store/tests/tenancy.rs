@@ -1139,3 +1139,44 @@ fn the_user_stamp_sees_same_length_renames_and_policy_changes_but_not_others() {
     t.store.lock(Scope::User(t.a)).set_review_policy(t.a_secret, Some(ReviewPolicy::Auto)).unwrap();
     assert_eq!(b3, stamp(t.b), "A's private changes do not move B's stamp");
 }
+
+/// Code review 2026-11-22, item 13: declining a flagged agent move runs the
+/// move's checks on the way back. B's agent moved D out from under X; X then
+/// went into A's Family (B an editor), and B was made a viewer. Reverting
+/// would put B's doc into a workspace she cannot write: the decline is
+/// treated as superseded and D stays where it is.
+#[test]
+fn declining_an_agent_move_does_not_move_a_doc_where_the_reviewer_cannot() {
+    let t = setup();
+    let (x, d, ann) = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let b_agent = s.create_principal(PrincipalKind::Agent, "claude:b-agent", None).unwrap().id;
+        let x = s.create_doc("X", None, t.b_human).unwrap().id;
+        let d = s.create_doc("D", Some(x), t.b_human).unwrap().id;
+        let out = s
+            .propose_doc_op(d, b_agent, OpKind::MoveDoc {
+                new_parent: None,
+                sort_key: None,
+                new_parent_title: None,
+                from_parent: None,
+                from_sort_key: None,
+                from_parent_title: None,
+            }, vec![])
+            .unwrap();
+        assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
+        let ann = s.review_queue(Some(d)).unwrap().pop().unwrap().annotation.id;
+        (x, d, ann)
+    };
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    t.store.lock(Scope::User(t.b)).move_doc(x, Some(t.shared_doc), None).unwrap();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Viewer).unwrap();
+    let mut s = t.store.lock(Scope::User(t.b));
+    let receipt = s.resolve(ann, t.b_human, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(receipt.op_ids.is_empty(), "superseded: nothing reverted");
+    assert_eq!(s.get_doc(d).unwrap().parent_id, None, "D stays in B's Unsorted");
+    assert_eq!(s.doc_workspace(d).unwrap(), None);
+    assert!(s.review_queue(Some(d)).unwrap().is_empty(), "the flag is closed");
+    drop(s);
+    // A sees nothing of D
+    not_found(t.store.lock(Scope::User(t.a)).get_doc(d));
+}

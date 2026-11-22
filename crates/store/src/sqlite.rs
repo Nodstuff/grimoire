@@ -3375,6 +3375,21 @@ fn resolve_doc_op(
         | (AnnotationKind::Parked, ReviewDecision::Decline) => Ok(None),
         (AnnotationKind::Review, ReviewDecision::Decline) => {
             let inverse = inverse_of(&op.kind, None)?;
+            // the way back is a move like any other: authorized as the
+            // reviewer's own (space change, writable parent), exactly as the
+            // accept path checks a parked move. If it can no longer be made
+            // (the old parent went somewhere the reviewer cannot write), the
+            // decline is superseded: the doc stays (code review 2026-11-22,
+            // item 13)
+            if let OpKind::MoveDoc { new_parent, .. } = &inverse {
+                match check_move(tx, scope, doc_id, *new_parent) {
+                    Ok(_) => {}
+                    Err(StoreError::Forbidden(_) | StoreError::NotFound(_)) => {
+                        return Ok(Some(ApplyReceipt { doc_id, epoch: current, op_ids: vec![] }));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             project_doc_op(tx, doc_id, &inverse)?;
             let mut note = String::new();
             if let OpKind::RenameDoc { title, from_title } = &inverse {
