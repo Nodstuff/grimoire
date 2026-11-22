@@ -243,16 +243,28 @@ function StatusPill({ doc, readOnly, onChanged }: { doc: Doc; readOnly: boolean;
 }
 
 /** "+ tag": writes the doc's frontmatter (a hidden block) through the gate. */
-function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
+export function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
   const [editing, setEditing] = useState(false)
   const [v, setV] = useState('')
+  // Enter unmounts the input, whose blur fires done again: one tag only
+  // (the same guard as DocTitle's rename)
+  const finishing = useRef(false)
   if (!editing)
     return (
-      <button type="button" className="dv-pill dv-pill-dashed" onClick={() => setEditing(true)}>
+      <button
+        type="button"
+        className="dv-pill dv-pill-dashed"
+        onClick={() => {
+          finishing.current = false
+          setEditing(true)
+        }}
+      >
         + tag
       </button>
     )
   const done = async () => {
+    if (finishing.current) return
+    finishing.current = true
     const t = v.trim().replace(/^#/, '')
     setEditing(false)
     setV('')
@@ -269,6 +281,7 @@ function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
       onKeyDown={(e) => {
         if (e.key === 'Enter') done()
         if (e.key === 'Escape') {
+          finishing.current = true
           setV('')
           setEditing(false)
         }
