@@ -454,6 +454,35 @@ import UniformTypeIdentifiers
         Block(id: id, docID: "d", parentID: parent, orderKey: key, blockType: type, content: c)
     }
 
+    /// Review 2026-11-22 #3: the block observer and the review poll both
+    /// start a remote pass, and each suspends on the cache. An older pass
+    /// that resumes after a newer one has merged must not put its older
+    /// snapshot back on screen.
+    @Test func anOlderRemotePassNeverLandsAfterANewerOne() async throws {
+        let h = try await Harness.stored([Self.blk("b0", "one", key: "i")])
+        try await Harness.store([Self.blk("b0", "two", key: "i")], epoch: 2, in: h.cache)
+        final class Gate { var reads = 0; var open = false }
+        let gate = Gate()
+        h.model.afterRemoteRead = {
+            gate.reads += 1
+            // the first pass, holding epoch 2's body, waits for the second
+            if gate.reads == 1 { while !gate.open { try? await Task.sleep(for: .milliseconds(5)) } }
+        }
+        let older = Task { await h.model.refreshFromCache() }
+        while gate.reads == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        try await Harness.store([Self.blk("b0", "three", key: "i")], epoch: 3, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["three"])
+        gate.open = true
+        await older.value
+        #expect(h.markdown == ["three"], "epoch 2's body came back over epoch 3's")
+        // a later pass on its own still merges
+        h.model.afterRemoteRead = nil
+        try await Harness.store([Self.blk("b0", "four", key: "i")], epoch: 4, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["four"])
+    }
+
     /// "mine" typed to "mine!" while the server changed it to "theirs"
     /// (epoch 2): b0 in conflict on epoch 1, nothing saved yet.
     func conflicted() async throws -> Harness {

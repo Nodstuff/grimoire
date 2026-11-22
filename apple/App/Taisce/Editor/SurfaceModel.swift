@@ -102,6 +102,8 @@ final class SurfaceModel: NSObject {
     @ObservationIgnored private(set) var dynamicType: DynamicTypeSize = .large
     @ObservationIgnored private var wantsFocus = false
     @ObservationIgnored private var pendingRemote: DocEditor?
+    /// counts remote passes; a pass whose number is no longer the latest stops
+    @ObservationIgnored private var remotePass = 0
     @ObservationIgnored lazy var formattingBar: FormattingBar = FormattingBar(model: self)
     @ObservationIgnored private var headerHost: UIHostingController<AnyView>?
     @ObservationIgnored private var footerHost: UIHostingController<AnyView>?
@@ -1304,19 +1306,33 @@ final class SurfaceModel: NSObject {
     func setReviewQueue(_ ops: Set<String>) { openOps = ops }
     /// Every queued outbox write has landed in the outbox.
     func settle() async { await queue?.value }
+    /// Runs inside a remote pass between reading the cached body and
+    /// merging it (tests hold a pass there to race a newer one).
+    @ObservationIgnored var afterRemoteRead: (@MainActor () async -> Void)?
 
-    /// The cached body was rewritten (sync): merge it in.
+    /// The cached body was rewritten (sync): merge it in. Passes overlap
+    /// (the block observer and the review poll both start one, and each
+    /// suspends on the cache): a pass that a newer one has started since
+    /// stops at its next step, so an older snapshot never lands on top of
+    /// a newer one. The newest pass read the cache last.
     private func remoteChanged() async {
         guard let cache else { return }
+        remotePass &+= 1
+        let pass = remotePass
+        var superseded: Bool { pass != remotePass }
         if let landed = try? await cache.lastLandedEpoch(docID), let rec = try? await cache.doc(docID),
            let body = rec.bodyEpoch, body < landed { return }
+        guard !superseded else { return }
         let before = abandoned + unpersisted
         guard var fresh = try? await cache.editor(for: docID) else { return }
+        await afterRemoteRead?()
+        guard !superseded else { return }
         // our edits parked for review stay on screen as ours, in conflict
         // on their propose's epoch, until a human decides. Only from a
         // review queue the server gave us: unknown (offline, not fetched
         // yet, a failed fetch with nothing known) overlays nothing
         if let open = openOps, let parked = try? await cache.parkedOps(for: docID, openOps: open) {
+            guard !superseded else { return }
             var c = conflicts
             parkedBlocks = ParkedEdits.apply(parked, on: &fresh, conflicts: &c, parkedBefore: parkedBlocks, released: released)
             // a decision on a released block: nothing to hold back any more
@@ -1329,6 +1345,7 @@ final class SurfaceModel: NSObject {
         if !conflicts.isEmpty, let records = try? await cache.blocks(of: docID) {
             for r in records where conflicts[r.block.id] != nil { own[r.block.id] = Surface.baselineContent(r.block) }
         }
+        guard !superseded else { return }
         var seen: Set<String> = []
         for r in before + abandoned + unpersisted where seen.insert(r.requestID ?? "").inserted {
             fresh.overlay(r.ops.map(\.kind))
