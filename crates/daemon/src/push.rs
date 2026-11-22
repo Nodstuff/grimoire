@@ -424,44 +424,81 @@ impl Coalescer {
     }
 }
 
+/// After a failed read of the devices or the audience, read again this soon
+/// even if the journal does not move.
+const READ_RETRY: Duration = Duration::from_secs(5);
+
 /// Follow the journal head and nudge every active device, coalesced.
 pub async fn push_loop<S: Sender>(store: taisce_store::SharedStore, feed: Feed, sender: Arc<S>, window: Duration) {
+    run_push_loop(store, feed, sender, window, READ_RETRY, None).await
+}
+
+/// `push_loop`, with the retry pause and (tests) a count of reads to fail.
+async fn run_push_loop<S: Sender>(
+    store: taisce_store::SharedStore,
+    feed: Feed,
+    sender: Arc<S>,
+    window: Duration,
+    retry_after: Duration,
+    faults: Option<Arc<std::sync::atomic::AtomicUsize>>,
+) {
     let mut head = feed.subscribe();
     // a boot is not a change: start from the journal as it stands
     // the fan-out sees every user's rows: System, then per-user filtering
     let mut seen = with_store(&store, Scope::System, |s| s.latest_change_seq()).await.unwrap_or(0);
     let mut co = Coalescer::new(window);
     let mut envs: HashMap<String, String> = HashMap::new();
+    // set while a failed read waits to be tried again
+    let mut retry: Option<Instant> = None;
     loop {
         let next = co.next_due();
+        let mut read = false;
         tokio::select! {
             r = head.changed() => {
                 if r.is_err() {
                     return;
                 }
-                let seq = *head.borrow_and_update();
-                if seq != seen {
-                    let since = seen;
-                    seen = seq;
-                    // a device hears about a change only if its user can see
-                    // one of the changed docs (or a row addressed to them)
-                    let got = with_store(&store, Scope::System, move |s| {
-                        Ok::<_, taisce_store::StoreError>((s.push_devices_active()?, s.change_audience(since)?))
-                    })
-                    .await;
-                    match got {
-                        Ok((ds, audience)) => {
-                            envs = ds.iter().map(|d| (d.token.clone(), d.env.clone())).collect();
-                            co.changed_for(ds.into_iter().map(|d| {
-                                let owes = audience.contains(&d.user_id);
-                                (d.token, owes)
-                            }));
-                        }
-                        Err(e) => tracing::warn!("push: reading devices failed: {e}"),
-                    }
-                }
+                read = true;
             }
             _ = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {}
+            _ = tokio::time::sleep_until(retry.unwrap_or_else(Instant::now)), if retry.is_some() => read = true,
+        }
+        let seq = *head.borrow_and_update();
+        if read && seq != seen {
+            let since = seen;
+            let fail = faults.as_ref().is_some_and(|f| {
+                f.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+            });
+            // a device hears about a change only if its user can see
+            // one of the changed docs (or a row addressed to them)
+            let got = if fail {
+                Err(taisce_store::StoreError::InvalidOp("injected read failure".into()))
+            } else {
+                with_store(&store, Scope::System, move |s| {
+                    Ok::<_, taisce_store::StoreError>((s.push_devices_active()?, s.change_audience(since)?))
+                })
+                .await
+            };
+            match got {
+                Ok((ds, audience)) => {
+                    // only a read that answered moves the watermark: a failed
+                    // one is read again from the same `since`, so its changes'
+                    // nudges are not dropped (code review 2026-11-22, item 10)
+                    seen = seq;
+                    retry = None;
+                    envs = ds.iter().map(|d| (d.token.clone(), d.env.clone())).collect();
+                    co.changed_for(ds.into_iter().map(|d| {
+                        let owes = audience.contains(&d.user_id);
+                        (d.token, owes)
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!("push: reading devices failed: {e}");
+                    retry = Some(Instant::now() + retry_after);
+                }
+            }
+        } else if read {
+            retry = None;
         }
         for token in co.take_due(Instant::now()) {
             let env = envs.get(&token).cloned().unwrap_or_else(|| "production".into());
@@ -893,6 +930,35 @@ mod tests {
         assert_eq!(v["aps"]["alert"], json!({"title": "2 finished", "body": "taisce/main, qompass/mcp-dx"}));
         assert_eq!(v["aps"]["interruption-level"], "passive");
         assert_eq!((p.collapse_id().as_deref(), p.priority()), (Some("fabric:finished"), "5"));
+    }
+
+    /// Code review 2026-11-22, item 10: a failed read of the devices or the
+    /// audience no longer drops that change's nudges. The watermark stays
+    /// put, the read is tried again (here after 100 ms, with the journal
+    /// quiet), and the device is nudged for the change.
+    #[tokio::test]
+    async fn a_failed_read_is_retried_and_its_nudge_still_goes() {
+        let t = setup();
+        let live = "aa".repeat(32);
+        t.store.lock(taisce_store::Scope::System).push_device_upsert(t.tom, &live, "ios", "sandbox", "", 1).unwrap();
+        let feed = Feed::new(&t.store);
+        let mock = Arc::new(Mock::default());
+        let faults = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let task = tokio::spawn(run_push_loop(
+            t.store.clone(),
+            feed,
+            mock.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Some(faults.clone()),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let author = t.store.lock(taisce_store::Scope::System).list_principals().unwrap()[0].id;
+        t.store.lock(taisce_store::Scope::System).create_doc("one", None, author).unwrap();
+        wait_for("the nudge after the retried read", || !mock.sent.lock().unwrap().is_empty()).await;
+        assert_eq!(faults.load(std::sync::atomic::Ordering::SeqCst), 0, "the first read failed");
+        assert_eq!(mock.sent.lock().unwrap()[0].1, live);
+        task.abort();
     }
 
     #[tokio::test]
