@@ -523,7 +523,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -606,6 +606,13 @@ fn backfill(conn: &Connection) -> Result<()> {
             "UPDATE fabric_turns SET seq = rowid WHERE seq IS NULL;
              CREATE INDEX IF NOT EXISTS fabric_turns_seq ON fabric_turns (seq);",
         )?;
+    }
+    if version < 18 {
+        // v18: ops by target block. `block_readable` (behind `mask_anchor`,
+        // on every comment read_doc returns) and the e-reader tagger look a
+        // block's ops up by `target_block`, which scanned the whole ledger
+        // (code review 2026-11-22, item 15)
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS ops_by_target ON ops (target_block);")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -4893,6 +4900,34 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// v18: an older database gets `ops_by_target`, and the hot lookups by
+    /// target block use it instead of scanning the ledger.
+    #[test]
+    fn v18_indexes_ops_by_target_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.conn.execute_batch("DROP INDEX ops_by_target; PRAGMA user_version = 17;").unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let plan = |sql: &str| -> String {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            st.query_map(["x"], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
+        };
+        for sql in [
+            // block_readable's shape (history_pred aside)
+            "SELECT EXISTS (SELECT 1 FROM ops WHERE target_block = ?1 AND op_type = 'delete' AND epoch_applied IS NOT NULL)",
+            // ereader_tagger's
+            "SELECT payload FROM ops WHERE target_block = ?1 AND epoch_applied IS NOT NULL ORDER BY rowid DESC",
+        ] {
+            let p = plan(sql);
+            assert!(p.contains("ops_by_target"), "{sql}: {p}");
+        }
     }
 
     /// v17: a v16 database's Agent Fabric turns get their insertion
