@@ -72,6 +72,10 @@ const BlockId = Extension.create({
           // longer holds (cut, then pasted) stays, so a move keeps its id;
           // one from another doc is given a fresh id by planSave.
           transformPasted: (slice, view) => {
+            // a drag that moves its blocks: prosemirror-view transforms the
+            // slice before deleting the source, so its ids still look present;
+            // they are the same blocks moving, and keep their ids
+            if (view.dragging?.move) return slice
             const present = new Set<string>()
             view.state.doc.forEach((n) => {
               if (n.attrs.blockId) present.add(n.attrs.blockId)
@@ -515,6 +519,9 @@ export default function DocEditor({
     if (!plan) return
     // an earlier request with no answer goes as it was (same id): a page
     // cannot sequence two keepalives, and that one may already have landed.
+    // The trade-off: typing after it is not sent as the page goes (the
+    // beforeunload prompt is its guard); it stays in a bfcache'd page, which
+    // saves it on return after adopting the earlier answer
     const req = pending.current && pending.current.body !== plan.body ? pending.current : plan.body ? asRequest({ ...plan, body: plan.body }) : null
     if (!req) return
     pending.current = req
