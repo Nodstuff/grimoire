@@ -4019,7 +4019,16 @@ impl SqliteStore {
     /// would fail. The transaction is closed whatever `f` returns.
     pub fn read_snapshot<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> Result<T> {
         self.conn.execute_batch("BEGIN DEFERRED")?;
-        let out = f(self);
+        // a panic inside `f` must not leave the shared connection in an open
+        // transaction: the mutex is recovered after a poison (scope.rs), and
+        // every later BEGIN on it would fail (code review 2026-11-22, item 16)
+        let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(out) => out,
+            Err(panic) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                std::panic::resume_unwind(panic);
+            }
+        };
         self.conn.execute_batch("COMMIT")?;
         Ok(out)
     }
@@ -4900,6 +4909,22 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// A panic inside `read_snapshot` rolls its transaction back: the
+    /// connection is usable afterwards, writes included.
+    #[test]
+    fn a_panic_inside_read_snapshot_leaves_no_open_transaction() {
+        use crate::{BlockStore, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = s.read_snapshot(|_| -> () { panic!("boom") });
+        }));
+        assert!(r.is_err());
+        assert!(s.conn.is_autocommit(), "no transaction left open");
+        s.create_doc("after", None, p).unwrap();
+        assert_eq!(s.read_snapshot(|s| s.list_docs().unwrap().len()).unwrap(), 1);
     }
 
     /// v18: an older database gets `ops_by_target`, and the hot lookups by
