@@ -119,13 +119,17 @@ final class FabricStub: @unchecked Sendable {
             lock.withLock { turnsAfter.append(query["after"] ?? "") }
             if failTurns { return refuse("503 Service Unavailable", "unavailable") }
             let ended = { (t: [String: Any]) in t["ended"] as? Int ?? 0 }
-            // `after=`: the turns ended since, oldest first; else newest first
+            // `after=`: the turns ended since, oldest first; else newest first,
+            // `before=` exclusive; at most `limit`, with `more` past it
+            let all = turns[parts[4]] ?? []
+            let limit = query["limit"].flatMap(Int.init) ?? all.count
             if let after = query["after"].flatMap(Int.init) {
-                let list = (turns[parts[4]] ?? []).filter { ended($0) > after }.sorted { ended($0) < ended($1) }
-                return ("200 OK", json(["turns": list, "more": false]))
+                let list = all.filter { ended($0) > after }.sorted { ended($0) < ended($1) }
+                return ("200 OK", json(["turns": Array(list.prefix(limit)), "more": list.count > limit]))
             }
-            let list = (turns[parts[4]] ?? []).sorted { ended($0) > ended($1) }
-            return ("200 OK", json(["turns": list, "more": false]))
+            let before = query["before"].flatMap(Int.init) ?? .max
+            let list = all.filter { ended($0) < before }.sorted { ended($0) > ended($1) }
+            return ("200 OK", json(["turns": Array(list.prefix(limit)), "more": list.count > limit]))
         case ("POST", 6, "sessions") where parts[5] == "follow", ("DELETE", 6, "sessions") where parts[5] == "follow":
             server.update(session: parts[4]) { $0["following"] = method == "POST" }
             let s = (server.fleetJSON["sessions"] as? [[String: Any]] ?? []).first { $0["id"] as? String == parts[4] } ?? [:]

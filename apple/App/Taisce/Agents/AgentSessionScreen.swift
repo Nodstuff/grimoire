@@ -19,6 +19,10 @@ struct AgentSessionScreen: View {
     @State private var position = ScrollPosition(idType: String.self, edge: .bottom)
     /// the person is at (or very near) the newest turn: a new one scrolls into view
     @State private var nearBottom = true
+    /// where the first drawn turn sits in the visible region (y from its top,
+    /// and its height), and that region's height: Earlier turns puts it back
+    /// exactly there once older turns are in above it
+    @State private var firstRow = CGRect.zero
     @FocusState private var composing: Bool
 
     init(key: FleetSessionKey) {
@@ -119,7 +123,7 @@ struct AgentSessionScreen: View {
                     headerCard(SessionHeader(s, runtime: runtime, now: context.date), s)
                 }
                 if feed.hasEarlier {
-                    Button { Task { await feed.showEarlier(store.fabricService, cache: store.turnCache) } } label: {
+                    Button { showEarlier() } label: {
                         Label(feed.loadingOlder ? "Loading\u{2026}" : "Earlier turns", systemImage: "arrow.up.circle")
                             .frame(maxWidth: .infinity)
                     }
@@ -152,6 +156,9 @@ struct AgentSessionScreen: View {
                         TurnView(row: row, whole: feed.expanded[row.id]) { feed.expand(row.id, $0) }.equatable()
                     }
                     .id(row.id)
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .scrollView) } action: { frame in
+                        if row.id == feed.rows.first?.id { firstRow = frame }
+                    }
                 }
                 if s.state == .working || s.state == .stalled {
                     TimelineView(.periodic(from: .now, by: 30)) { context in runningNow(s, now: context.date) }
@@ -188,6 +195,8 @@ struct AgentSessionScreen: View {
         } action: { _, near in
             nearBottom = near
         }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentInsets.top } action: { _, top in insetTop = top }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { _, y in offsetY = y }
         // a new turn comes into view only when the person was at the bottom:
         // not while they read older ones, and never when older ones load above
         .onChange(of: feed.rows.last?.id) { old, new in
@@ -203,6 +212,33 @@ struct AgentSessionScreen: View {
         }
         .refreshable { await feed.refresh(store.fabricService, cache: store.turnCache) }
     }
+
+    /// Older turns go in above the first drawn one, and that one stays where
+    /// the person sees it: a scroll view keeps its offset, so without this the
+    /// new turns would push it down and out of sight. The turn is scrolled to
+    /// the top of the visible region (exact, whatever the new turns' heights),
+    /// then down by how far below that top it was.
+    private func showEarlier() {
+        let anchor = feed.rows.first?.id
+        let below = firstRow.minY - insetTop
+        Task {
+            await feed.showEarlier(store.fabricService, cache: store.turnCache)
+            guard let anchor, feed.rows.first?.id != anchor else { return }
+            var quiet = Transaction(animation: nil)
+            quiet.disablesAnimations = true
+            withTransaction(quiet) { position.scrollTo(id: anchor, anchor: .top) }
+            // the layout that puts it at the top, then the offset it had under it
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(16))
+            withTransaction(quiet) { position.scrollTo(y: offsetY - below) }
+        }
+    }
+
+    /// how far the feed is scrolled (content offset)
+    @State private var offsetY: CGFloat = 0
+
+    /// the visible region's top in the scroll view's space (under the bar)
+    @State private var insetTop: CGFloat = 0
 
     private func headerCard(_ h: SessionHeader, _ s: FleetSession) -> some View {
         VStack(alignment: .leading, spacing: 6) {

@@ -153,7 +153,9 @@ final class FabricUITests: XCTestCase {
         let r = row(app, address)
         XCTAssertTrue(r.waitForExistence(timeout: 15))
         r.tap()
-        XCTAssertTrue(el(app, "session.header").waitForExistence(timeout: 10), "\(address) opened")
+        // a long session opens at its newest turn: its header may be above, not drawn
+        let ids = ["session.header", "session.composer", "session.resume"]
+        waitFor("\(address) opened", timeout: 10) { ids.contains { self.el(app, $0).exists } }
     }
 
     // MARK: tests
@@ -179,6 +181,69 @@ final class FabricUITests: XCTestCase {
         XCTAssertEqual(stub.turnsAfterSeen.last, String(newest - 1))
         XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'No turns yet'")).firstMatch.exists)
         shot(app, "session-from-cache")
+    }
+
+    /// A long session: it opens at its newest turn; Earlier turns shows
+    /// older ones above without moving what the person was reading (from
+    /// memory first, then from the server); a turn that finishes while they
+    /// read older ones does not pull them down; a background task's prompt
+    /// is a line, not a bubble of raw XML; a reply's Markdown is drawn.
+    func testEarlierTurnsKeepTheScrollPositionAndANewTurnDoesNotYank() throws {
+        let replies = [
+            "Short answer.",
+            "## Plan\n\n1. Read the stream code\n2. Move the deadline\n   - only on a message\n\n```rust\nlet deadline = now + beat;\n```",
+            "A longer paragraph that wraps over a few lines on a phone, so the turns are not all one height and the scroll position has to be kept by more than arithmetic.",
+        ]
+        let (app, stub) = try launch(setup: { stub in
+            stub.turns[StubFleet.id(1)] = (1...45).map { i in
+                FabricStub.turn(1, address: "taisce/main", id: "t\(i)", prompt: i == 44 ? "<task-notification>\n<task-id>b7</task-id>\n<status>completed</status>\n<summary>Agent &quot;Review Apple UI views&quot; finished</summary>\n<result>3 findings</result>\n</task-notification>" : "Step \(i)",
+                                reply: replies[i % replies.count], tools: i % 4, ago: (46 - i) * 120)
+            }
+        })
+        open(app, "taisce/main")
+        let newest = el(app, "turn.t45")
+        XCTAssertTrue(newest.waitForExistence(timeout: 10), "opens at the newest turn")
+        XCTAssertTrue(newest.isHittable, "already scrolled to the bottom")
+        // the background task's prompt
+        let note = app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'Background task: Agent \"Review Apple UI views\" finished'")).firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 5), "a line from its summary")
+        XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS '<task-notification'")).firstMatch.exists, "no raw XML")
+        // Markdown drawn: no ## or fences as text
+        XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH '## '")).firstMatch.exists)
+        shot(app, "session-long-bottom")
+
+        // up to the top of what is drawn (the newest 20: t26…t45)
+        let earlier = el(app, "session.earlier")
+        for _ in 0..<12 where !(earlier.exists && earlier.isHittable) { app.swipeDown(velocity: .fast) }
+        XCTAssertTrue(earlier.isHittable, "Earlier turns at the top")
+        let top = el(app, "turn.t26")
+        XCTAssertTrue(top.exists)
+        let before = top.frame.minY
+        // a turn finishes meanwhile: the person reading up here stays put
+        let ended = Int(Date().timeIntervalSince1970)
+        var live = FabricStub.turn(1, address: "taisce/main", id: "t46", prompt: "Step 46", reply: "Done.", ago: 0)
+        live["ended"] = ended
+        stub.server.broadcast("turn", live)
+        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+        XCTAssertEqual(top.frame.minY, before, accuracy: 2, "a new turn does not move what is being read")
+        // Earlier turns from memory: t16…t25 above, t26 where it was
+        earlier.tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(1))
+        XCTAssertEqual(top.frame.minY, before, accuracy: 4, "older turns load above without a jump")
+        XCTAssertEqual(stub.turnsAfterSeen.count, 1, "from memory: no turns request")
+        shot(app, "session-earlier-kept")
+        // again: now from the server (before=)
+        for _ in 0..<12 where !(earlier.exists && earlier.isHittable) { app.swipeDown(velocity: .fast) }
+        let top2 = el(app, "turn.t16")
+        XCTAssertTrue(top2.exists && earlier.isHittable)
+        let before2 = top2.frame.minY
+        earlier.tap()
+        waitFor("an older page was read") { stub.turnsAfterSeen.count == 2 }
+        RunLoop.current.run(until: Date().addingTimeInterval(1))
+        XCTAssertEqual(top2.frame.minY, before2, accuracy: 4, "a page from the server loads above without a jump")
+        // back down: the live turn is there
+        for _ in 0..<20 where !el(app, "turn.t46").isHittable { app.swipeUp(velocity: .fast) }
+        XCTAssertTrue(el(app, "turn.t46").isHittable)
     }
 
     func testPairingThenAReplyWaitsOutItsUndoAndGoesSigned() throws {

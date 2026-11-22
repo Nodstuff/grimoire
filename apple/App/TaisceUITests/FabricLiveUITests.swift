@@ -53,7 +53,8 @@ final class FabricLiveUITests: XCTestCase {
         if !row.waitForExistence(timeout: 10), el(app, "agents.resting").exists { el(app, "agents.resting").tap() }
         XCTAssertTrue(row.waitForExistence(timeout: 10), "\(address) is in the fleet")
         row.tap()
-        XCTAssertTrue(el(app, "session.header").waitForExistence(timeout: 10), "\(address) opened")
+        // a long session opens at its newest turn: the header may be above, not drawn
+        waitFor("\(address) opened", timeout: 10) { ["session.header", "session.composer", "session.resume"].contains { self.el(app, $0).exists } }
     }
 
     /// Allow once: the system asks for Face ID (and, the first time, whether

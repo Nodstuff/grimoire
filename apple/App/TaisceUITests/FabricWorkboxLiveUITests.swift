@@ -95,7 +95,8 @@ final class FabricWorkboxLiveUITests: XCTestCase {
         sessionRow = row(app, session, timeout: 15)
         XCTAssertTrue(sessionRow.exists)
         sessionRow.tap()
-        XCTAssertTrue(el(app, "session.header").waitForExistence(timeout: 10))
+        // a long session opens at its newest turn: the header may be above, not drawn
+        waitFor("the session opened", timeout: 10) { ["session.header", "session.composer", "session.resume"].contains { self.el(app, $0).exists } }
         shot(app, "04-session")
         send(app, "Reply with just the word PEARTREE and nothing else.")
         waitFor("the real session answered the phone's reply", timeout: 120) {
