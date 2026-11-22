@@ -87,3 +87,55 @@ describe('drawDiagram', () => {
     }
   })
 })
+
+describe('safeSvg keeps legitimate content', () => {
+  it('real reladraw output: a root link, a pasted icon with <use> and a raster data: image survive; javascript: does not', async () => {
+    const src =
+      'icon crate """\n<svg viewBox="0 0 10 10"><defs><path id="a" d="M0 0h10v10z"/></defs><use href="#a"/><image href="data:image/png;base64,iVBORw0KGgo=" width="5" height="5"/></svg>\n"""\n' +
+      'node c icon: crate\nnode d "Doc" right of c url: "/doc/123"\nnode e "Up" right of d url: "../x"\nnode f "Bad" right of e url: "javascript:alert(1)"\nnode g icon: disk right of f'
+    const r = await renderReladraw(src, 'light')
+    if ('err' in r) throw new Error(r.err)
+    expect(r.svg).toMatch(/<use href="#/)
+    const out = dom(safeSvg(r.svg))
+    const hrefs = [...out.querySelectorAll('a')].map((a) => a.getAttribute('href'))
+    expect(hrefs).toContain('/doc/123')
+    expect(hrefs).toContain('../x')
+    expect(out.innerHTML).not.toMatch(/javascript:/i)
+    const use = out.querySelector('use')!
+    expect(use.getAttribute('href')).toMatch(/^#/)
+    // (reladraw 0.15.1 prefixes the icon's ids but not its `href="#…"`, so the
+    // reference dangles in its own output; the sanitiser keeps both as given)
+    expect(out.querySelector('defs path[id]')).not.toBeNull()
+    expect(out.querySelector('image')!.getAttribute('href')).toBe('data:image/png;base64,iVBORw0KGgo=')
+  })
+
+  it('real mermaid output (jsdom, measured text stubbed): labels, a click link and the arrows survive unchanged', async () => {
+    const P = (window as unknown as { SVGElement: { prototype: Record<string, unknown> } }).SVGElement.prototype
+    P.getBBox = () => ({ x: 0, y: 0, width: 80, height: 20 })
+    P.getComputedTextLength = () => 50
+    const mermaid = (await import('mermaid')).default
+    mermaid.initialize({ startOnLoad: false, securityLevel: 'strict' })
+    const { svg } = await mermaid.render('mmd-t1', 'flowchart LR\n  A[Start] -->|go| B(End)\n  click A "/doc/123"')
+    const before = dom(svg)
+    const out = dom(safeSvg(svg))
+    expect(out.querySelector('a')!.getAttribute('href')).toBe('/doc/123')
+    expect(out.querySelectorAll('foreignObject').length).toBe(before.querySelectorAll('foreignObject').length)
+    expect(out.textContent).toContain('Start')
+    expect(out.textContent).toContain('go')
+    expect(out.querySelectorAll('marker').length).toBe(before.querySelectorAll('marker').length)
+    expect(out.querySelector('style')!.textContent).toBe(before.querySelector('style')!.textContent)
+  })
+
+  it('<use> pointing outside the drawing, svg+xml and other schemes still go', () => {
+    const out = dom(
+      safeSvg(
+        '<svg xmlns="http://www.w3.org/2000/svg"><use href="https://evil.example/x.svg#a"/><use href="data:image/svg+xml,<svg/>#a"/>' +
+          '<image href="data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+"/><image href="data:text/html,x"/>' +
+          '<a href="vbscript:x"><text>v</text></a><a href="ftp://x/y"><text>f</text></a><a href="javascript&#58;alert(1)"><text>j</text></a></svg>',
+      ),
+    )
+    for (const u of out.querySelectorAll('use')) expect(u.getAttribute('href')).toBeNull()
+    for (const i of out.querySelectorAll('image')) expect(i.getAttribute('href')).toBeNull()
+    for (const a of out.querySelectorAll('a')) expect(a.getAttribute('href')).toBeNull()
+  })
+})
