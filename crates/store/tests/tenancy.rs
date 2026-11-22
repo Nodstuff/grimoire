@@ -1231,3 +1231,33 @@ fn deleting_a_workspace_never_hands_a_doc_to_a_former_member() {
     }
     not_found(t.store.lock(Scope::User(t.b)).get_doc(rb));
 }
+
+/// Code review 2026-11-22, item 14: the share gate's write paths are
+/// all-or-nothing. An agent's `apply` into a shared doc whose second op
+/// cannot apply is refused with nothing written (it used to commit the
+/// first op and then answer an error); an agent's `create_doc_with_ops`
+/// under a shared parent that fails leaves no empty doc behind.
+#[test]
+fn the_share_gates_writes_are_all_or_nothing() {
+    let t = setup();
+    let mut s = t.store.lock(Scope::User(t.a));
+    let before = s.read_doc(t.shared_doc).unwrap();
+    let epoch = s.get_doc(t.shared_doc).unwrap().current_epoch;
+    let queue = s.review_queue(None).unwrap().len();
+    let missing = OpInput { kind: OpKind::Replace { target: Uuid::now_v7(), content: "x".into() }, source_refs: vec![] };
+    let err = s.apply(t.shared_doc, epoch, t.agent, vec![para("first, fine"), missing]);
+    assert!(err.is_err(), "{err:?}");
+    assert_eq!(s.get_doc(t.shared_doc).unwrap().current_epoch, epoch, "no epoch moved");
+    assert_eq!(s.read_doc(t.shared_doc).unwrap().roots.len(), before.roots.len(), "the first op did not land");
+    assert_eq!(s.review_queue(None).unwrap().len(), queue, "no flag or park left behind");
+    // a gated create that fails: no doc
+    let doc_op = OpInput { kind: OpKind::SetStatus { status: Some(DocStatus::Draft), from_status: None }, source_refs: vec![] };
+    let err = s.create_doc_with_ops("Half made", Some(t.shared_doc), t.agent, vec![para("body"), doc_op]);
+    assert!(err.is_err(), "{err:?}");
+    assert!(s.list_docs().unwrap().iter().all(|d| d.title != "Half made"), "no empty doc committed");
+    // and the happy paths still land, flagged
+    let r = s.apply(t.shared_doc, epoch, t.agent, vec![para("agent line")]).unwrap();
+    assert_eq!(r.epoch, epoch + 1);
+    let (made, _) = s.create_doc_with_ops("Made", Some(t.shared_doc), t.agent, vec![para("body")]).unwrap();
+    assert_eq!(s.review_queue(Some(made.id)).unwrap().len(), 1);
+}

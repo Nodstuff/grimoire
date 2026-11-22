@@ -1806,18 +1806,22 @@ impl BlockStore for SqliteStore {
                 }
                 None => false,
             };
+        // the new doc has no policy of its own: it inherits its parent's
+        let policy = match (gated, parent) {
+            (true, Some(p)) => self.effective_policy(p)?,
+            _ => crate::DEFAULT_REVIEW_POLICY,
+        };
+        // the doc row and its content commit together, gated or not: a
+        // gated batch that fails leaves no empty doc behind (code review
+        // 2026-11-22, item 14)
         let tx = self.conn.transaction()?;
         insert_doc_row(&tx, id, title, parent, created_by, owner)?;
-        let ops = if n > 0 && !gated {
-            apply_in_tx(&tx, id, 0, created_by, ops)?;
-            Vec::new()
-        } else {
-            ops
-        };
-        tx.commit()?;
         if gated {
-            self.propose_impl(id, 0, created_by, ops, true)?;
+            propose_in_tx(&tx, id, 0, created_by, ops, true, true, policy)?;
+        } else if n > 0 {
+            apply_in_tx(&tx, id, 0, created_by, ops)?;
         }
+        tx.commit()?;
         Ok((self.get_doc(id)?, n))
     }
 
@@ -1913,10 +1917,18 @@ impl BlockStore for SqliteStore {
             if base_epoch != current {
                 return Err(StoreError::StaleBase { base: base_epoch, current });
             }
-            let out = self.propose_impl(doc_id, base_epoch, principal, ops, true)?;
+            check_propose_ops(&ops)?;
+            let policy = self.effective_policy(doc_id)?;
+            // all or nothing, like an ungated apply: an op that would not
+            // apply refuses the whole batch and nothing is written (it used
+            // to commit the rest and then answer the error; code review
+            // 2026-11-22, item 14)
+            let tx = self.conn.transaction()?;
+            let out = propose_in_tx(&tx, doc_id, base_epoch, principal, ops, true, true, policy)?;
             if let Some(v) = out.verdicts.iter().find(|v| !v.applied) {
                 return Err(StoreError::InvalidOp(format!("apply: {}", v.note)));
             }
+            tx.commit()?;
             return Ok(ApplyReceipt {
                 doc_id,
                 epoch: out.epoch,
@@ -4607,134 +4619,162 @@ impl SqliteStore {
         ops: Vec<OpInput>,
         cap_review: bool,
     ) -> Result<ProposeOutcome> {
-        if ops.is_empty() {
-            return Err(StoreError::InvalidOp("propose: empty op list".into()));
-        }
-        if let Some(op) = ops.iter().find(|o| o.kind.is_doc_op()) {
-            return Err(StoreError::InvalidOp(format!(
-                "propose: {} is a doc op — use rename_doc/move_doc/set_status/delete_doc",
-                op.kind.op_type()
-            )));
-        }
+        check_propose_ops(&ops)?;
         let policy = self.effective_policy(doc_id)?;
         // the share gate (ADR 0004 §5): an agent writing into a shared
         // workspace never lands green, and `auto` cannot clean it
         let shared_cap = tenancy::agent_into_shared(&self.conn, doc_id, principal)?;
-        let cap_review = cap_review || shared_cap;
         let tx = self.conn.transaction()?;
-        let current = doc_epoch(&tx, doc_id)?;
-        if base_epoch > current {
-            return Err(StoreError::InvalidOp(format!(
-                "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
-            )));
-        }
-
-        let candidate_epoch = current + 1;
-        let mut verdicts = Vec::with_capacity(ops.len());
-        let mut applied_any = false;
-        for op in &ops {
-            let op_id = Uuid::now_v7();
-            let mut op = op.clone();
-            resolve_order_keys(&tx, doc_id, &mut op.kind)?;
-            let op = &op;
-            let mut scored = if base_epoch == current {
-                Scored {
-                    verdict: Verdict::Green,
-                    confidence: 1.0,
-                    note: "current base".into(),
-                }
-            } else {
-                let mut lookup = |id: Uuid| block_by_id(&tx, doc_id, id).ok().flatten();
-                score_stale_op(&op.kind, base_epoch, &mut lookup)
-            };
-            // review cap: greens land as applied, flagged yellows (§5:
-            // auto-tagging as reviewable yellows, declinable as a batch)
-            if cap_review && scored.verdict == Verdict::Green {
-                scored.verdict = Verdict::Yellow;
-                scored.note = if shared_cap {
-                    format!("shared workspace: an agent's edit is flagged for its members; {}", scored.note)
-                } else {
-                    format!("review requested by proposer; {}", scored.note)
-                };
-            }
-
-            let prior = match op.kind.target_block() {
-                Some(t) => block_by_id(&tx, doc_id, t)?,
-                None => None,
-            };
-
-            let mut applied = false;
-            if scored.verdict != Verdict::Red {
-                match project(&tx, doc_id, candidate_epoch, principal, &op.kind) {
-                    Ok(()) => applied = true,
-                    // content-level failure downgrades to a parked red;
-                    // the gate never errors on content
-                    Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
-                        scored = Scored {
-                            verdict: Verdict::Red,
-                            confidence: 0.0,
-                            note: format!("projection failed: {e}"),
-                        };
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            insert_op_row(
-                &tx,
-                op_id,
-                doc_id,
-                op,
-                principal,
-                base_epoch,
-                applied.then_some(candidate_epoch),
-                scored.verdict,
-                scored.confidence,
-                &prior,
-            )?;
-            match scored.verdict {
-                Verdict::Green => {}
-                Verdict::Yellow => {
-                    // auto policy self-applies high-confidence yellows: no flag
-                    let auto_clean = !cap_review
-                        && policy == ReviewPolicy::Auto
-                        && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
-                    if !auto_clean {
-                        insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
-                    }
-                }
-                Verdict::Red => {
-                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
-                }
-            }
-            applied_any |= applied;
-            verdicts.push(ProposeVerdict {
-                op_id,
-                block_id: op.kind.target_block(),
-                verdict: scored.verdict,
-                confidence: scored.confidence,
-                applied,
-                note: scored.note,
-            });
-        }
-
-        let epoch = if applied_any {
-            candidate_epoch
-        } else {
-            current
-        };
-        if applied_any {
-            tx.execute(
-                "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
-                params![epoch, doc_id.to_string()],
-            )?;
-        }
+        let out = propose_in_tx(&tx, doc_id, base_epoch, principal, ops, cap_review, shared_cap, policy)?;
         tx.commit()?;
-        Ok(ProposeOutcome {
-            doc_id,
-            epoch,
-            verdicts,
-        })
+        Ok(out)
     }
+}
+
+/// What `propose` refuses before anything is scored: an empty batch, and
+/// doc ops (which have their own gate, `propose_doc_op`).
+fn check_propose_ops(ops: &[OpInput]) -> Result<()> {
+    if ops.is_empty() {
+        return Err(StoreError::InvalidOp("propose: empty op list".into()));
+    }
+    if let Some(op) = ops.iter().find(|o| o.kind.is_doc_op()) {
+        return Err(StoreError::InvalidOp(format!(
+            "propose: {} is a doc op — use rename_doc/move_doc/set_status/delete_doc",
+            op.kind.op_type()
+        )));
+    }
+    Ok(())
+}
+
+/// `propose_impl` inside the caller's transaction, which it does not
+/// commit: a caller that must be all-or-nothing (the share gate's `apply`,
+/// `create_doc_with_ops`) checks the outcome and commits or drops it.
+/// `shared_cap`: the share gate applies (an agent into a shared workspace);
+/// `policy`: the doc's effective review policy.
+#[allow(clippy::too_many_arguments)]
+fn propose_in_tx(
+    tx: &Transaction,
+    doc_id: Uuid,
+    base_epoch: i64,
+    principal: Uuid,
+    ops: Vec<OpInput>,
+    cap_review: bool,
+    shared_cap: bool,
+    policy: ReviewPolicy,
+) -> Result<ProposeOutcome> {
+    check_propose_ops(&ops)?;
+    let cap_review = cap_review || shared_cap;
+    let current = doc_epoch(tx, doc_id)?;
+    if base_epoch > current {
+        return Err(StoreError::InvalidOp(format!(
+            "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
+        )));
+    }
+
+    let candidate_epoch = current + 1;
+    let mut verdicts = Vec::with_capacity(ops.len());
+    let mut applied_any = false;
+    for op in &ops {
+        let op_id = Uuid::now_v7();
+        let mut op = op.clone();
+        resolve_order_keys(tx, doc_id, &mut op.kind)?;
+        let op = &op;
+        let mut scored = if base_epoch == current {
+            Scored {
+                verdict: Verdict::Green,
+                confidence: 1.0,
+                note: "current base".into(),
+            }
+        } else {
+            let mut lookup = |id: Uuid| block_by_id(tx, doc_id, id).ok().flatten();
+            score_stale_op(&op.kind, base_epoch, &mut lookup)
+        };
+        // review cap: greens land as applied, flagged yellows (§5:
+        // auto-tagging as reviewable yellows, declinable as a batch)
+        if cap_review && scored.verdict == Verdict::Green {
+            scored.verdict = Verdict::Yellow;
+            scored.note = if shared_cap {
+                format!("shared workspace: an agent's edit is flagged for its members; {}", scored.note)
+            } else {
+                format!("review requested by proposer; {}", scored.note)
+            };
+        }
+
+        let prior = match op.kind.target_block() {
+            Some(t) => block_by_id(tx, doc_id, t)?,
+            None => None,
+        };
+
+        let mut applied = false;
+        if scored.verdict != Verdict::Red {
+            match project(tx, doc_id, candidate_epoch, principal, &op.kind) {
+                Ok(()) => applied = true,
+                // content-level failure downgrades to a parked red;
+                // the gate never errors on content
+                Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
+                    scored = Scored {
+                        verdict: Verdict::Red,
+                        confidence: 0.0,
+                        note: format!("projection failed: {e}"),
+                    };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        insert_op_row(
+            &tx,
+            op_id,
+            doc_id,
+            op,
+            principal,
+            base_epoch,
+            applied.then_some(candidate_epoch),
+            scored.verdict,
+            scored.confidence,
+            &prior,
+        )?;
+        match scored.verdict {
+            Verdict::Green => {}
+            Verdict::Yellow => {
+                // auto policy self-applies high-confidence yellows: no flag
+                let auto_clean = !cap_review
+                    && policy == ReviewPolicy::Auto
+                    && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
+                if !auto_clean {
+                    insert_annotation(tx, doc_id, op_id, AnnotationKind::Review)?;
+                }
+            }
+            Verdict::Red => {
+                insert_annotation(tx, doc_id, op_id, AnnotationKind::Parked)?;
+            }
+        }
+        applied_any |= applied;
+        verdicts.push(ProposeVerdict {
+            op_id,
+            block_id: op.kind.target_block(),
+            verdict: scored.verdict,
+            confidence: scored.confidence,
+            applied,
+            note: scored.note,
+        });
+    }
+
+    let epoch = if applied_any {
+        candidate_epoch
+    } else {
+        current
+    };
+    if applied_any {
+        tx.execute(
+            "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+            params![epoch, doc_id.to_string()],
+        )?;
+    }
+    Ok(ProposeOutcome {
+        doc_id,
+        epoch,
+        verdicts,
+    })
 }
 
 /// Doc ops (AX slice B) at the store boundary: ledger shape, gate rules,
