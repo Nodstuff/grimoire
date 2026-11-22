@@ -433,6 +433,19 @@ pub async fn push_loop<S: Sender>(store: taisce_store::SharedStore, feed: Feed, 
     run_push_loop(store, feed, sender, window, READ_RETRY, None).await
 }
 
+/// After a wake, the head to read: Some only when this wake reads (a
+/// change, or a retry) and the head moved past `seen`. A wake that does not
+/// read (the coalescer's timer) leaves the head's version unmarked, so a
+/// change that landed meanwhile still fires `changed()` on the next turn
+/// (marking it seen here and not reading it dropped its nudges).
+fn head_to_read(read: bool, head: &mut tokio::sync::watch::Receiver<i64>, seen: i64) -> Option<i64> {
+    if !read {
+        return None;
+    }
+    let seq = *head.borrow_and_update();
+    (seq != seen).then_some(seq)
+}
+
 /// `push_loop`, with the retry pause and (tests) a count of reads to fail.
 async fn run_push_loop<S: Sender>(
     store: taisce_store::SharedStore,
@@ -463,8 +476,7 @@ async fn run_push_loop<S: Sender>(
             _ = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {}
             _ = tokio::time::sleep_until(retry.unwrap_or_else(Instant::now)), if retry.is_some() => read = true,
         }
-        let seq = *head.borrow_and_update();
-        if read && seq != seen {
+        if let Some(seq) = head_to_read(read, &mut head, seen) {
             let since = seen;
             let fail = faults.as_ref().is_some_and(|f| {
                 f.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
@@ -930,6 +942,21 @@ mod tests {
         assert_eq!(v["aps"]["alert"], json!({"title": "2 finished", "body": "taisce/main, qompass/mcp-dx"}));
         assert_eq!(v["aps"]["interruption-level"], "passive");
         assert_eq!((p.collapse_id().as_deref(), p.priority()), (Some("fabric:finished"), "5"));
+    }
+
+    /// Review of the fix branch: a timer wake (no read) must not mark a
+    /// pending head change seen, or that change is never read and its
+    /// nudges are lost.
+    #[tokio::test]
+    async fn a_timer_wake_leaves_a_pending_change_for_the_next_turn() {
+        let (tx, mut head) = tokio::sync::watch::channel(0i64);
+        tx.send(5).unwrap();
+        assert_eq!(head_to_read(false, &mut head, 0), None, "the timer wake reads nothing");
+        assert!(head.has_changed().unwrap(), "and leaves the change pending");
+        tokio::time::timeout(Duration::from_secs(1), head.changed()).await.expect("changed() still fires").unwrap();
+        assert_eq!(head_to_read(true, &mut head, 0), Some(5));
+        assert!(!head.has_changed().unwrap());
+        assert_eq!(head_to_read(true, &mut head, 5), None, "nothing new");
     }
 
     /// Code review 2026-11-22, item 10: a failed read of the devices or the
