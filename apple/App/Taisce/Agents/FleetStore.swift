@@ -41,8 +41,17 @@ final class FleetStore {
     /// tests: a cache of their own
     @ObservationIgnored var turnCacheOverride: Cache?
 
-    private(set) var fleet = Fleet()
-    private(set) var availability: Availability = .unknown
+    private(set) var fleet = Fleet() { didSet { cardChanged() } }
+    private(set) var availability: Availability = .unknown { didSet { cardChanged() } }
+    /// Today's way in (a phone's), set only when what it says changes:
+    /// Today reads this, not the fleet, so the stream's updates that leave
+    /// the card as it was (most of them) redraw nothing there
+    private(set) var todayCard: FleetCard?
+
+    private func cardChanged() {
+        let card = FleetCard(fleet, available: isLoaded)
+        if card != todayCard { todayCard = card }
+    }
     private(set) var link: FleetLink = .idle
     /// why the fleet isn't loading (nil once it has)
     private(set) var loadError: String?

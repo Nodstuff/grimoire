@@ -20,7 +20,8 @@ struct TodayScreen: View {
             badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites),
             review: home.review,
             // a phone's way in (iPad and the Mac have Agents in the sidebar)
-            agents: router.isPad ? nil : FleetCard(model.fleet.fleet, available: model.fleet.isLoaded),
+            // the card's summary, not the fleet: a fleet update that leaves it as it was redraws nothing here
+            agents: router.isPad ? nil : model.fleet.todayCard,
             reading: reading,
             readingCover: reading.flatMap { books.coverURL($0.book) },
             due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus).map { TodayDue.rows($0) },
