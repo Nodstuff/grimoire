@@ -14,7 +14,8 @@ struct SearchScreen: View {
     @State private var everywhere = false
     @State private var scope: SearchScope = .docs
     @State private var books: SearchBooks = .idle
-    @State private var ask: AskState = .idle
+    @State private var asker = AskRunner()
+    private var ask: AskState { asker.state }
     @FocusState private var focused: Bool
     /// kept for the split view's call site; the field is always the system's now
     var showsField = true
@@ -66,27 +67,68 @@ struct SearchScreen: View {
             books = await SearchBooks.load(router.searchQuery, store: model.books)
         }
         // a new question forgets the old answer
-        .onChange(of: router.searchQuery) { _, q in
-            if case .answer(let a) = ask, a.question != q { ask = .idle }
-            if case .nothing(let old) = ask, old != q { ask = .idle }
-        }
+        .onChange(of: router.searchQuery) { _, q in asker.queryChanged(q) }
+        // leaving Search stops following an answer
+        .onDisappear { asker.cancel() }
     }
 
     private func runAsk() {
         let q = router.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty, let api = model.api else { return }
         scope = .ask
-        ask = .asking(q)
-        Task { @MainActor in
-            ask = await AskState.run(q, api: api)
-            // the synthesis lands a few seconds after the doc: follow it
-            var tries = 0
-            while case .answer(let a) = ask, a.pending, tries < 30, router.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == q {
-                try? await Task.sleep(for: .seconds(3))
-                tries += 1
-                if let next = await AskState.reload(a, api: api) { ask = .answer(next) }
+        asker.start(q, ask: { await AskState.run($0, api: api) }, reload: { await AskState.reload($0, api: api) })
+    }
+}
+
+/// Ask's run: one question at a time. The answer doc's synthesis lands a
+/// few seconds after the doc, so a run follows it (every `every`, up to
+/// `tries` times). A new question cancels the run before it, and so does
+/// leaving the screen: two runs never race to set the answer, and no poll
+/// outlives the screen.
+@MainActor @Observable
+final class AskRunner {
+    private(set) var state: AskState = .idle
+    @ObservationIgnored private var task: Task<Void, Never>?
+    @ObservationIgnored var every: Duration = .seconds(3)
+    @ObservationIgnored var tries = 30
+    /// the words in the field now: a run follows its answer only while they are its question
+    @ObservationIgnored private var query = ""
+
+    func start(_ q: String, ask: @escaping @MainActor (String) async -> AskState, reload: @escaping @MainActor (AskResult) async -> AskResult?) {
+        task?.cancel()
+        query = q
+        state = .asking(q)
+        task = Task { [weak self] in
+            let answer = await ask(q)
+            guard let self, !Task.isCancelled else { return }
+            state = answer
+            var n = 0
+            while case .answer(let a) = state, a.pending, n < tries, query.trimmingCharacters(in: .whitespacesAndNewlines) == q {
+                try? await Task.sleep(for: every)
+                guard !Task.isCancelled else { return }
+                n += 1
+                if let next = await reload(a), !Task.isCancelled { state = .answer(next) }
             }
         }
+    }
+
+    /// The words changed: an answer to other words goes, and its run stops.
+    func queryChanged(_ q: String) {
+        query = q
+        switch state {
+        case .answer(let a) where a.question != q:
+            cancel()
+            state = .idle
+        case .nothing(let old) where old != q:
+            cancel()
+            state = .idle
+        default: break
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
     }
 }
 
