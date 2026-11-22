@@ -94,6 +94,18 @@ private struct Paragraph: View {
     }
 }
 
+extension TapArea {
+    /// A list item's checkbox: the nested-aware one when the item holds a
+    /// nested checklist (whose boxes sit just right of and below its own).
+    static func checkbox(for item: RenderNode.ListItem) -> TapArea {
+        let nested = item.children.contains { node in
+            if case .list(_, _, let items) = node { return items.contains { $0.checked != nil } }
+            return false
+        }
+        return nested ? .checkboxOverNested : .checkbox
+    }
+}
+
 private struct ListBlock: View {
     @Environment(\.checkboxToggle) private var toggle
     let ordered: Bool
@@ -106,7 +118,7 @@ private struct ListBlock: View {
             let offsets = RenderMetrics.itemOffsets(items, base: checkboxBase)
             ForEach(Array(items.enumerated()), id: \.offset) { i, item in
                 let base = offsets[i]
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: TapArea.checkboxGap) {
                     marker(i, item, index: base)
                     NodeStack(nodes: item.children, checkboxBase: base + (item.checked == nil ? 0 : 1), spacing: 6)
                         .opacity(isChecked(item, base) ? 0.6 : 1)
@@ -130,7 +142,7 @@ private struct ListBlock: View {
                     .docFont(.body)
                     .foregroundStyle(checked ? Color.lapis.green : Color.lapis.ink3)
                     .frame(width: 28, height: 28)
-                    .tapArea(.checkbox)
+                    .tapArea(.checkbox(for: item))
             }
             .buttonStyle(.plain)
             .disabled(toggle.action == nil)

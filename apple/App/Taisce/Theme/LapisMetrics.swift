@@ -113,28 +113,45 @@ struct TapArea: Equatable {
     var drawn: CGSize
     /// the hit area wanted around it
     var target: CGSize
+    /// at most this far past the trailing side (a neighbour sits there)
+    var maxTrailing: CGFloat? = nil
 
     /// how far the hit shape reaches past each side
-    var insets: (h: CGFloat, v: CGFloat) {
-        (max(0, (target.width - drawn.width) / 2), max(0, (target.height - drawn.height) / 2))
+    var insets: (leading: CGFloat, trailing: CGFloat, v: CGFloat) {
+        let h = max(0, (target.width - drawn.width) / 2)
+        return (h, min(h, maxTrailing ?? h), max(0, (target.height - drawn.height) / 2))
     }
+
+    /// the gap between a list checkbox and its item's text (ListBlock's
+    /// HStack spacing), where a nested list's checkboxes also start
+    static let checkboxGap: CGFloat = 10
 
     /// a doc checkbox: 28 pt in a list whose rows are 8 pt apart, so 44 wide
     /// and as tall as the row pitch (28 + 8) without reaching a neighbour
     static let checkbox = TapArea(drawn: CGSize(width: 28, height: 28), target: CGSize(width: Lapis.Layout.minTarget, height: 36))
+    /// the checkbox of an item holding a nested checklist: the nested
+    /// boxes start `checkboxGap` to its right, close enough below that the
+    /// two reaches meet, and theirs reaches back into the gap; this one
+    /// reaches only what is left of it, so the two never overlap
+    static let checkboxOverNested = TapArea(drawn: checkbox.drawn, target: checkbox.target,
+                                            maxTrailing: checkboxGap - checkbox.insets.leading)
     /// the pencil on a block shown as an attachment (a caption glyph in 6 pt of padding)
     static let editSource = TapArea(drawn: CGSize(width: 26, height: 26), target: CGSize(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget))
     /// the sidebar's New folder (a 30 pt square)
     static let newFolder = TapArea(drawn: CGSize(width: 30, height: 30), target: CGSize(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget))
+
+    static func == (a: TapArea, b: TapArea) -> Bool {
+        a.drawn == b.drawn && a.target == b.target && a.maxTrailing == b.maxTrailing
+    }
 }
 
 extension View {
     /// Hit-testable across `area.target` around the view; drawn and laid
     /// out as before.
     func tapArea(_ area: TapArea) -> some View {
-        let (h, v) = area.insets
-        return padding(.horizontal, h).padding(.vertical, v)
+        let (l, t, v) = area.insets
+        return padding(.leading, l).padding(.trailing, t).padding(.vertical, v)
             .contentShape(.rect)
-            .padding(.horizontal, -h).padding(.vertical, -v)
+            .padding(.leading, -l).padding(.trailing, -t).padding(.vertical, -v)
     }
 }
