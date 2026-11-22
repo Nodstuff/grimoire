@@ -755,8 +755,10 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     let (r, req) = h.authorize(&q).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(r.body.contains("Doc Client"));
-    let c = h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().unwrap();
-    assert_eq!((c.kind.as_str(), c.redirect_uris.clone()), ("cimd", vec![REDIRECT.to_string()]));
+    // held in memory only until someone signs in with it (code review
+    // 2026-11-22, item 2: an unauthenticated /authorize stores nothing)
+    assert!(h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().is_none(), "not stored before a grant");
+    assert_eq!(h.st.cimd.lock().unwrap().len(), 1);
     // a redirect the document does not list
     let q2 = q.replace("33418/callback", "33418/elsewhere");
     assert_eq!(h.authorize(&q2).await.0.status, StatusCode::BAD_REQUEST);
@@ -764,6 +766,52 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     let redirect = h.sign_in(&req.unwrap()).await;
     let code = Url::parse(&redirect).unwrap().query_pairs().find(|(k, _)| k == "code").unwrap().1.into_owned();
     assert_eq!(h.exchange(&id, &code, VERIFIER).await.status, StatusCode::OK);
+    // the grant stored it: its tokens name it, and the sweep keeps it
+    let c = h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().unwrap();
+    assert_eq!((c.kind.as_str(), c.redirect_uris.clone()), ("cimd", vec![REDIRECT.to_string()]));
+    assert_eq!(h.st.cimd.lock().unwrap().len(), 0);
+    h.st.store.lock(taisce_store::Scope::System).oauth_cleanup(now() + 2 * 86400).unwrap();
+    assert!(h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().is_some(), "a signed-in client is never pruned");
+}
+
+/// Code review 2026-11-22, item 2: DCR is unauthenticated, so registrations
+/// nobody signs in with are capped (the oldest make room) and swept after a
+/// day; a client someone signed in with is never removed.
+#[tokio::test]
+async fn unused_registrations_are_capped_and_swept_but_signed_in_clients_stay() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let used = h.register("Claude", REDIRECT).await;
+    let code = h.code_for(&used).await;
+    assert_eq!(h.exchange(&used, &code, VERIFIER).await.status, StatusCode::OK);
+    {
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        for i in 0..crate::auth::oauth::MAX_UNUSED_CLIENTS {
+            s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+                client_id: format!("dcr_flood{i:04}"),
+                kind: "dcr".into(),
+                client_name: "flood".into(),
+                redirect_uris: vec![REDIRECT.into()],
+                metadata: "{}".into(),
+                created_at: now() - 10_000 + i as i64,
+                refresh_at: None,
+            })
+            .unwrap();
+        }
+    }
+    let fresh = h.register("Another", REDIRECT).await;
+    {
+        let s = h.st.store.lock(taisce_store::Scope::System);
+        assert!(s.oauth_client("dcr_flood0000").unwrap().is_none(), "the oldest unused client made room");
+        assert!(s.oauth_client("dcr_flood0001").unwrap().is_some());
+        assert!(s.oauth_client(&fresh).unwrap().is_some());
+        assert!(s.oauth_client(&used).unwrap().is_some(), "the signed-in client is never evicted");
+        assert!(s.oauth_client(FIRST_PARTY_APP_CLIENT).unwrap().is_some(), "nor the app's");
+    }
+    h.st.store.lock(taisce_store::Scope::System).oauth_cleanup(now() + 86400 + 1).unwrap();
+    let s = h.st.store.lock(taisce_store::Scope::System);
+    assert!(s.oauth_client(&fresh).unwrap().is_none() && s.oauth_client("dcr_flood0001").unwrap().is_none(), "swept after a day");
+    assert!(s.oauth_client(&used).unwrap().is_some() && s.oauth_client(FIRST_PARTY_APP_CLIENT).unwrap().is_some());
 }
 
 /// A client metadata document may list any redirect it likes; the app's

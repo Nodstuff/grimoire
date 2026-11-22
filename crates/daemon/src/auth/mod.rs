@@ -133,6 +133,8 @@ pub struct AuthState {
     pub webauthn: Arc<webauthn_rs::Webauthn>,
     pub pending: Arc<Mutex<passkey::Pending>>,
     pub limiter: ratelimit::Limiter,
+    /// CIMD documents not yet behind a grant (`oauth::CimdMemory`).
+    pub cimd: Arc<Mutex<oauth::CimdMemory>>,
 }
 
 impl AuthState {
@@ -150,6 +152,7 @@ impl AuthState {
             webauthn: Arc::new(webauthn),
             pending: Arc::new(Mutex::new(passkey::Pending::default())),
             limiter: ratelimit::Limiter::default(),
+            cimd: Arc::new(Mutex::new(oauth::CimdMemory::default())),
         })
     }
 }

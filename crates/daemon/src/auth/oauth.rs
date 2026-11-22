@@ -242,7 +242,17 @@ pub async fn resolve_client(st: &AuthState, client_id: &str) -> Result<OAuthClie
     {
         return Ok(c.clone());
     }
+    // a document fetched for a sign-in nobody has finished lives only in
+    // memory (bounded); it reaches the store when a grant is issued
+    // (`persist_cimd_client`), so an unauthenticated /authorize cannot grow
+    // the clients table (code review 2026-11-22, item 2)
+    if cached.is_none()
+        && let Some(c) = st.cimd.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(client_id, now)
+    {
+        return Ok(c);
+    }
     let doc = cimd::fetch(client_id, st.cfg.cimd_allow_insecure).await?;
+    let stored = cached.is_some();
     let client = OAuthClient {
         client_id: doc.client_id,
         kind: "cimd".into(),
@@ -252,11 +262,67 @@ pub async fn resolve_client(st: &AuthState, client_id: &str) -> Result<OAuthClie
         created_at: cached.map(|c| c.created_at).unwrap_or(now),
         refresh_at: Some(now + cimd::CACHE_TTL),
     };
-    let c = client.clone();
-    with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_upsert_client(&c)).await.map_err(|e| e.to_string())?;
-    tracing::info!(target: AUDIT, event = "client.cimd_fetch", client = client.client_id, name = client.client_name);
+    if stored {
+        let c = client.clone();
+        with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_upsert_client(&c)).await.map_err(|e| e.to_string())?;
+    } else {
+        st.cimd.lock().unwrap_or_else(std::sync::PoisonError::into_inner).put(client.clone());
+    }
+    tracing::info!(target: AUDIT, event = "client.cimd_fetch", client = client.client_id, name = client.client_name, stored);
     Ok(client)
 }
+
+/// CIMD documents fetched for sign-ins that have not reached a grant yet:
+/// in memory, at most [`CimdMemory::MAX`], each until its `refresh_at`.
+#[derive(Default)]
+pub struct CimdMemory {
+    held: HashMap<String, OAuthClient>,
+}
+
+impl CimdMemory {
+    pub const MAX: usize = 256;
+
+    fn get(&self, client_id: &str, now: i64) -> Option<OAuthClient> {
+        self.held.get(client_id).filter(|c| c.refresh_at.is_some_and(|t| t > now)).cloned()
+    }
+
+    /// Hold `c`; when full, the entry closest to going stale makes room.
+    fn put(&mut self, c: OAuthClient) {
+        if !self.held.contains_key(&c.client_id)
+            && self.held.len() >= Self::MAX
+            && let Some(oldest) = self.held.values().min_by_key(|c| c.refresh_at).map(|c| c.client_id.clone())
+        {
+            self.held.remove(&oldest);
+        }
+        self.held.insert(c.client_id.clone(), c);
+    }
+
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+}
+
+/// A CIMD client is stored once someone signed in with it: called after the
+/// code and PKCE checked out, before the grant is issued. A no-op for DCR
+/// clients and for a CIMD client already stored.
+async fn persist_cimd_client(st: &AuthState, client_id: &str) -> Result<(), String> {
+    if !cimd::is_cimd(client_id) {
+        return Ok(());
+    }
+    let id = client_id.to_string();
+    if with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_client(&id)).await.map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
+    }
+    // the held document (or, past its TTL or after a restart, a fresh fetch)
+    let client = resolve_client(st, client_id).await?;
+    st.cimd.lock().unwrap_or_else(std::sync::PoisonError::into_inner).held.remove(client_id);
+    with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_upsert_client(&client)).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// At most this many registered clients nobody has signed in with
+/// (`oauth_evict_unused_clients`); the daily sweep removes them too.
+pub const MAX_UNUSED_CLIENTS: usize = 500;
 
 /// RFC 7591 dynamic registration, public clients only: a request for any
 /// token_endpoint_auth_method but `none` is refused (invalid_client_metadata).
@@ -360,8 +426,17 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
         refresh_at: None,
     };
     let c = client.clone();
-    if let Err(e) = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_upsert_client(&c)).await {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string());
+    let stored = with_store(&st.store, taisce_store::Scope::System, move |s| {
+        // registration is unauthenticated: the oldest unused clients make room
+        let evicted = s.oauth_evict_unused_clients(MAX_UNUSED_CLIENTS - 1)?;
+        s.oauth_upsert_client(&c)?;
+        Ok::<_, taisce_store::StoreError>(evicted)
+    })
+    .await;
+    match stored {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(target: AUDIT, event = "client.evicted_unused", clients = n, ip),
+        Err(e) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string()),
     }
     tracing::info!(target: AUDIT, event = "client.register", client = client.client_id, name = client.client_name, ip);
     no_store(
@@ -652,6 +727,9 @@ async fn code_grant(
     }
     if !pkce_verifier_ok(verifier) || pkce_s256(verifier) != c.code_challenge {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");
+    }
+    if let Err(e) = persist_cimd_client(st, client_id).await {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e);
     }
     let grant = Grant {
         id: uuid::Uuid::now_v7(),
