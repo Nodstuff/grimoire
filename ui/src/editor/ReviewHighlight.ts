@@ -4,16 +4,19 @@
 // comment-count bubble at the right edge of a commented block. The maps live
 // in plugin state and are swapped without remounting via a transaction meta:
 //   setReviewMap(editor, map, extras)
-// Decorations are rebuilt on every doc change so they follow the block.
+// An edit that touches no block under review or with comments only maps the
+// decorations (mapDecos); one that does rebuilds them, and the word diffs
+// are cached by (before, now) text, so typing re-diffs at most the block it
+// is in.
 //
 // The bar's buttons carry data-resolve / data-ann; DocView handles the click
 // (the editor never talks to the API about review).
 
 import { Extension, type Editor } from '@tiptap/core'
-import { Plugin, PluginKey, type EditorState } from '@tiptap/pm/state'
+import { Plugin, PluginKey, type EditorState, type Transaction } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
 import type { Node as PMNode } from '@tiptap/pm/model'
-import { wordDiff } from './docMeta'
+import { wordDiff, type DiffSeg } from './docMeta'
 
 /** yellow = applied, flagged; red = proposed, not applied; red-delete = a
  * proposed deletion of this block */
@@ -152,13 +155,32 @@ function textPositions(node: PMNode, pos: number): number[] {
   return at
 }
 
-function diffDecos(node: PMNode, pos: number, before: string, out: Decoration[]) {
+/** Word diffs by (before, now): a rebuild re-diffs only a block whose text
+ * changed. Bounded; the oldest entries go first. */
+const diffCache = new Map<string, DiffSeg[]>()
+const DIFF_CACHE_MAX = 256
+export function cachedWordDiff(before: string, now: string): DiffSeg[] {
+  const key = `${before}\u0000${now}`
+  let segs = diffCache.get(key)
+  if (segs) {
+    // most recently used last
+    diffCache.delete(key)
+    diffCache.set(key, segs)
+    return segs
+  }
+  segs = wordDiff(before, now)
+  diffCache.set(key, segs)
+  if (diffCache.size > DIFF_CACHE_MAX) diffCache.delete(diffCache.keys().next().value!)
+  return segs
+}
+
+function diffDecos(node: PMNode, pos: number, before: string, out: Decoration[], id: string) {
   const now = node.textContent
   if (before === now) return
   const at = textPositions(node, pos)
   if (at.length !== now.length) return
   let off = 0
-  for (const seg of wordDiff(before, now)) {
+  for (const seg of cachedWordDiff(before, now)) {
     if (seg.t === 'eq') off += seg.s.length
     else if (seg.t === 'ins') {
       const from = at[off]
@@ -167,18 +189,53 @@ function diffDecos(node: PMNode, pos: number, before: string, out: Decoration[])
       off += seg.s.length
     } else if (seg.s.trim()) {
       const where = off < at.length ? at[off] : at.length ? at[at.length - 1] + 1 : pos + 1
-      const del = el('del', 'rv-del', seg.s.trim())
-      out.push(Decoration.widget(where, del, { side: -1, ignoreSelection: true, key: `del-${where}-${seg.s}` }))
+      const text = seg.s.trim()
+      // drawn only when ProseMirror needs a new one (the key matches the old);
+      // keyed within the block, so mapped and rebuilt sets agree
+      out.push(Decoration.widget(where, () => el('del', 'rv-del', text), { side: -1, ignoreSelection: true, key: `del-${id}-${where - pos}-${seg.s}` }))
       if (off < at.length) {
         // a space so the struck words don't run into the next ones
-        const sp = el('span', 'rv-del-gap', ' ')
-        out.push(Decoration.widget(where, sp, { side: -1, ignoreSelection: true, key: `gap-${where}` }))
+        out.push(Decoration.widget(where, () => el('span', 'rv-del-gap', ' '), { side: -1, ignoreSelection: true, key: `gap-${id}-${where - pos}` }))
       }
     }
   }
 }
 
-function buildDecos(state: EditorState, map: ReviewMap, extras: ReviewExtras): DecorationSet {
+/** Does `tr` change, remove or add a top-level node that carries a
+ * decoration (a block under review or with comments)? Checked on both sides
+ * of every step, a node beside the change included (an insert at a block's
+ * edge can make another node the block's last). An attribute step (the
+ * editor's blockId stamp) moves nothing: it gives a new block a fresh id. */
+export function touchesDecorated(tr: Transaction, map: ReviewMap, comments: Record<string, number>): boolean {
+  const marked = (node: PMNode) => {
+    const id = node.attrs?.blockId as string | null | undefined
+    return !!id && (!!map[id] || !!comments[id])
+  }
+  const hits = (doc: PMNode, from: number, to: number) => {
+    let hit = false
+    const lo = Math.max(0, from - 1)
+    const hi = Math.min(doc.content.size, to + 1)
+    if (lo > hi) return false
+    doc.nodesBetween(lo, hi, (node) => {
+      if (marked(node)) hit = true
+      return false // top-level nodes only
+    })
+    return hit
+  }
+  for (let i = 0; i < tr.steps.length; i++) {
+    const before = tr.docs[i]
+    const after = i + 1 < tr.docs.length ? tr.docs[i + 1] : tr.doc
+    let hit = false
+    tr.steps[i].getMap().forEach((oldStart, oldEnd, newStart, newEnd) => {
+      if (hit) return
+      hit = hits(before, oldStart, oldEnd) || hits(after, newStart, newEnd)
+    })
+    if (hit) return true
+  }
+  return false
+}
+
+export function buildDecos(state: EditorState, map: ReviewMap, extras: ReviewExtras): DecorationSet {
   const details = extras.details ?? {}
   const comments = extras.comments ?? {}
   if (Object.keys(map).length === 0 && Object.keys(comments).length === 0) return DecorationSet.empty
@@ -205,7 +262,7 @@ function buildDecos(state: EditorState, map: ReviewMap, extras: ReviewExtras): D
     const d = details[id]
     const last = lastPosOf.get(id) === pos
     decos.push(Decoration.node(pos, pos + node.nodeSize, { class: `review-${tone}${d && last ? ' review-barred' : ''}` }))
-    if (d && tone === 'yellow' && d.beforeText != null) diffDecos(node, pos, d.beforeText, decos)
+    if (d && tone === 'yellow' && d.beforeText != null) diffDecos(node, pos, d.beforeText, decos, id)
     if (d && last) {
       const key = `bar-${d.annotationId}-${d.canResolve ? 1 : 0}-${d.accept}`
       decos.push(Decoration.widget(pos + node.nodeSize, () => reviewBar(d), { side: -1, ignoreSelection: true, stopEvent: () => true, key }))
@@ -225,7 +282,12 @@ export const ReviewHighlight = Extension.create({
           apply: (tr, old, _oldState, newState) => {
             const next = tr.getMeta(reviewKey) as { map: ReviewMap; extras: ReviewExtras } | undefined
             if (next) return { map: next.map, extras: next.extras, decos: buildDecos(newState, next.map, next.extras) }
-            if (tr.docChanged) return { ...old, decos: buildDecos(newState, old.map, old.extras) }
+            if (tr.docChanged) {
+              // typing elsewhere: the decorations only move with the text
+              if (!touchesDecorated(tr, old.map, (old.extras as ReviewExtras).comments ?? {}))
+                return { ...old, decos: old.decos.map(tr.mapping, tr.doc) }
+              return { ...old, decos: buildDecos(newState, old.map, old.extras) }
+            }
             return old
           },
         },
