@@ -28,8 +28,8 @@ use webauthn_rs::prelude::{
 const AUTHZ_TTL: i64 = 600;
 const MAX_AUTHZ: usize = 1000;
 const MAX_ENROLL: usize = 100;
-/// Outstanding sign-in requests (and web ceremonies) one IP may hold: a
-/// flood from one address evicts only its own oldest, never anyone else's.
+/// Outstanding sign-in requests (and web ceremonies) one address
+/// (`shares::ip_key`) may hold: a flood from one address evicts its own oldest.
 pub(super) const MAX_PENDING_PER_IP: usize = 8;
 /// A passkey challenge is good for two minutes after the button is pressed.
 pub const CEREMONY_TTL: i64 = 120;
@@ -75,19 +75,24 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// Hold a sign-in request. One IP holds at most `MAX_PENDING_PER_IP`
-    /// (its own oldest goes); when the whole map is full the new request is
-    /// refused (None) rather than evicting someone else's.
+    /// Hold a sign-in request. One address (`shares::ip_key`: an IPv4, or
+    /// an IPv6 /64) holds at most `MAX_PENDING_PER_IP`, its own oldest
+    /// going; when the whole map is full the oldest request anyone holds
+    /// makes room. Refusing instead let ~125 addresses lock every person
+    /// out of sign-in (code review 2026-11-22, item 6). Always Some.
     pub fn add_authz(&mut self, r: AuthzRequest) -> Option<String> {
         self.sweep(r.created);
+        let key = crate::shares::ip_key(&r.ip);
         let mine: Vec<(String, i64)> =
-            self.authz.iter().filter(|(_, v)| v.ip == r.ip).map(|(k, v)| (k.clone(), v.created)).collect();
+            self.authz.iter().filter(|(_, v)| crate::shares::ip_key(&v.ip) == key).map(|(k, v)| (k.clone(), v.created)).collect();
         if mine.len() >= MAX_PENDING_PER_IP
             && let Some((oldest, _)) = mine.iter().min_by_key(|(_, t)| *t)
         {
             self.authz.remove(oldest);
-        } else if self.authz.len() >= MAX_AUTHZ {
-            return None;
+        } else if self.authz.len() >= MAX_AUTHZ
+            && let Some(oldest) = self.authz.iter().min_by_key(|(_, v)| v.created).map(|(k, _)| k.clone())
+        {
+            self.authz.remove(&oldest);
         }
         let id = random_token();
         self.authz.insert(id.clone(), r);
@@ -99,16 +104,21 @@ impl Pending {
         self.authz.contains_key(id)
     }
 
-    /// Hold a web UI sign-in challenge, under the same per-IP rule.
+    /// Hold a web UI sign-in challenge, under the same rules (per address,
+    /// then the oldest anyone holds makes room). Always Some.
     pub(super) fn add_web(&mut self, c: WebCeremony) -> Option<String> {
         self.sweep(c.at);
-        let mine: Vec<(String, i64)> = self.web.iter().filter(|(_, v)| v.ip == c.ip).map(|(k, v)| (k.clone(), v.at)).collect();
+        let key = crate::shares::ip_key(&c.ip);
+        let mine: Vec<(String, i64)> =
+            self.web.iter().filter(|(_, v)| crate::shares::ip_key(&v.ip) == key).map(|(k, v)| (k.clone(), v.at)).collect();
         if mine.len() >= MAX_PENDING_PER_IP
             && let Some((oldest, _)) = mine.iter().min_by_key(|(_, t)| *t)
         {
             self.web.remove(oldest);
-        } else if self.web.len() >= MAX_AUTHZ {
-            return None;
+        } else if self.web.len() >= MAX_AUTHZ
+            && let Some(oldest) = self.web.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone())
+        {
+            self.web.remove(&oldest);
         }
         let id = random_token();
         self.web.insert(id.clone(), c);

@@ -1910,8 +1910,11 @@ async fn a_ceremony_lasts_two_minutes() {
     assert_eq!(r.status, StatusCode::GONE, "{}", r.body);
 }
 
+/// Code review 2026-11-22, item 6: a full map no longer refuses sign-ins
+/// (about 125 addresses could lock everyone out); the oldest request makes
+/// room, and an IPv6 /64 is one address.
 #[test]
-fn a_full_pending_map_refuses_new_sign_ins_rather_than_evicting() {
+fn a_full_pending_map_evicts_the_oldest_rather_than_refusing() {
     let h = harness();
     let mut p = passkey::Pending::default();
     let cer = || h.st.webauthn.start_discoverable_authentication().unwrap().1;
@@ -1924,14 +1927,24 @@ fn a_full_pending_map_refuses_new_sign_ins_rather_than_evicting() {
     p.add_web(passkey::WebCeremony { ip: "a".into(), at: t + 1, ceremony: cer() }).unwrap();
     assert_eq!(p.web.keys().filter(|k| mine.contains(k)).count(), passkey::MAX_PENDING_PER_IP - 1);
     assert!(p.web.contains_key(&other));
-    // whole map full (many IPs): a new address is refused, nobody is evicted
+    // whole map full (many IPs): a new address still gets its ceremony; the
+    // oldest anyone holds (A's and B's, at t) make room, newer ones stay
     let mut i = 0;
+    let mut newer = Vec::new();
     while p.web.len() < 1000 {
-        p.add_web(passkey::WebCeremony { ip: format!("ip{i}"), at: t + 1, ceremony: cer() }).unwrap();
+        newer.push(p.add_web(passkey::WebCeremony { ip: format!("10.0.{}.{}", i / 250, i % 250), at: t + 1, ceremony: cer() }).unwrap());
         i += 1;
     }
-    assert!(p.add_web(passkey::WebCeremony { ip: "late".into(), at: t + 1, ceremony: cer() }).is_none());
-    assert!(p.web.contains_key(&other), "the open sign-in is still there");
+    let late = p.add_web(passkey::WebCeremony { ip: "192.0.2.1".into(), at: t + 2, ceremony: cer() });
+    assert!(late.as_ref().is_some_and(|id| p.web.contains_key(id)), "a late sign-in is served, never refused");
+    assert_eq!(p.web.len(), 1000);
+    assert!(newer.iter().all(|id| p.web.contains_key(id)), "only an older ceremony went");
+    // one IPv6 /64 is one address: its ninth replaces its own oldest
+    let v6: Vec<String> = (0..passkey::MAX_PENDING_PER_IP)
+        .map(|n| p.add_web(passkey::WebCeremony { ip: format!("2001:db8:1:2::{n:x}"), at: t + 3, ceremony: cer() }).unwrap())
+        .collect();
+    p.add_web(passkey::WebCeremony { ip: "2001:db8:1:2:ffff::9".into(), at: t + 4, ceremony: cer() }).unwrap();
+    assert_eq!(v6.iter().filter(|id| p.web.contains_key(*id)).count(), passkey::MAX_PENDING_PER_IP - 1);
     // OAuth sign-in requests follow the same per-IP rule
     let req = |ip: &str| passkey::AuthzRequest {
         client_id: "c".into(),

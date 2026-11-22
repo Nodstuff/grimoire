@@ -67,8 +67,11 @@ impl Limiter {
 
     fn allow_at(&self, class: Class, ip: &str, now: Instant) -> bool {
         let (burst, per) = class.shape();
+        // per address as `shares::ip_key` folds it (an IPv6 /64 is one
+        // address); a key that is not an IP (a token's hash) is unchanged
+        let key = crate::shares::ip_key(ip);
         let mut m = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (tokens, at) = m.entry((class, ip.to_string())).or_insert((burst, now));
+        let (tokens, at) = m.entry((class, key)).or_insert((burst, now));
         let refill = now.saturating_duration_since(*at).as_secs_f64() / per;
         *tokens = (*tokens + refill).min(burst);
         *at = now;
@@ -107,5 +110,18 @@ mod tests {
         assert!(l.allow_at(Class::Register, "5.6.7.8", t0), "another ip has its own bucket");
         assert!(l.allow_at(Class::Login, "1.2.3.4", t0), "another class has its own bucket");
         assert!(l.allow_at(Class::Register, "1.2.3.4", t0 + Duration::from_secs(31)), "refilled");
+    }
+
+    /// Code review 2026-11-22, item 6: one IPv6 /64 is one address, as the
+    /// share and OPDS limiters already counted it.
+    #[test]
+    fn an_ipv6_slash_64_shares_one_bucket() {
+        let l = Limiter::default();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            assert!(l.allow_at(Class::Register, &format!("2001:db8:1:2::{i:x}"), t0));
+        }
+        assert!(!l.allow_at(Class::Register, "2001:db8:1:2:ffff::1", t0), "the same /64");
+        assert!(l.allow_at(Class::Register, "2001:db8:1:3::1", t0), "another /64");
     }
 }
