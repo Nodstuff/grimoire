@@ -340,7 +340,7 @@ final class FabricUITests: XCTestCase {
         let command = el(app, "approval.command")
         XCTAssertTrue(command.waitForExistence(timeout: 10), "verified against the key from the pairing code")
         XCTAssertTrue(command.label.contains(Self.approvalText) || app.staticTexts[Self.approvalText].exists)
-        XCTAssertTrue(el(app, "approval.expiry").label.contains("Expires in"))
+        XCTAssertTrue(el(app, "approval.expiry").label.contains("min left"))
         shot(app, "approval")
         el(app, "approval.allow").tap()
         waitFor("an approve was posted") { stub.postedOrders.contains { if case .command(let c) = $0.what { c.verb == .approve } else { false } } }

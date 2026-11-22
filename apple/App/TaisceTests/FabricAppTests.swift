@@ -578,7 +578,8 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         other.sessions[1].fabric = "qompass"
         let b2 = FleetBoard(other, now: Self.now)
         #expect(b2.fabrics == ["taisce", "qompass"] && b2.only("qompass").rows.map(\.session.sessionID) == ["s2"])
-        #expect(FabricWords.countdown(to: Self.nowS + 892, now: Self.now) == "14:52")
+        #expect(FabricWords.countdown(to: Self.nowS + 892, now: Self.now) == "15 min left")
+        #expect(FabricWords.countdown(to: Self.nowS + 52, now: Self.now) == "52 s left")
         #expect(FabricWords.countdown(to: Self.nowS - 1, now: Self.now) == "Expired")
     }
 

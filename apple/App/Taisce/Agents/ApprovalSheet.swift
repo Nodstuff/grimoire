@@ -96,7 +96,7 @@ struct ApprovalSheet: View {
                 Text("Signed by your Mac").font(.caption).foregroundStyle(Color.lapis.ink3)
                 Spacer(minLength: 0)
                 if r.expiresAt > 0 {
-                    Text(expired ? "Expired: it was refused" : "Expires in \(FabricWords.countdown(to: Int(r.expiresAt), now: now)) \u{00B7} then it is refused")
+                    Text(expired ? "Expired: it was refused" : "\(FabricWords.countdown(to: Int(r.expiresAt), now: now)) \u{00B7} refused at \(FabricWords.clockTime(Int(r.expiresAt)))")
                         .font(.caption.weight(.semibold)).monospacedDigit()
                         .foregroundStyle(expired ? Color.lapis.red : Color.lapis.ink2)
                         .accessibilityIdentifier("approval.expiry")

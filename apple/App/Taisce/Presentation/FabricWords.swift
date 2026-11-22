@@ -131,12 +131,19 @@ enum FabricWords {
         }
     }
 
-    /// "14:52" left; "Expired".
+    /// "15 min left", "52 s left", "Expired". Never "14:52": beside a deadline
+    /// that reads as a clock time (Tom took one for the hour it ran out).
     static func countdown(to unix: Int, now: Date) -> String {
         let left = Int(Double(unix) - now.timeIntervalSince1970)
         guard left > 0 else { return "Expired" }
-        if left >= 3600 { return "\(left / 3600) h \((left % 3600) / 60) min" }
-        return String(format: "%d:%02d", left / 60, left % 60)
+        if left >= 3600 { return "\(left / 3600) h \((left % 3600) / 60) min left" }
+        if left < 60 { return "\(left) s left" }
+        return "\((left + 59) / 60) min left"
+    }
+
+    /// The deadline as a clock time on this device: "10:06".
+    static func clockTime(_ unix: Int) -> String {
+        Date(timeIntervalSince1970: TimeInterval(unix)).formatted(date: .omitted, time: .shortened)
     }
 }
 
