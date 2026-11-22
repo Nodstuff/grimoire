@@ -171,7 +171,8 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(order.counter > 5, "above what the runtime last took from this device")
         let body = try #require(fake.postedBodies.first)
         #expect(FabricSignature.verify(publicKey: Self.deviceKey.publicKey, context: .order, payload: body.payload, signature: body.signature))
-        #expect(s.command.pending.isEmpty)
+        // it stays held (its words safe) until the post answers, then goes
+        await until("gone once posted") { s.command.pending.isEmpty }
     }
 
     @Test func theKeyboardsTrailingSpaceIsNotSent() async throws {
