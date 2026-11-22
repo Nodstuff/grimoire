@@ -59,6 +59,8 @@ struct SearchScreen: View {
         }
         .task(id: BooksKey(query: router.searchQuery, scope: scope)) {
             guard scope == .books else { return }
+            // the old results never stand for the new words while it waits
+            books = SearchBooks.waiting(for: router.searchQuery)
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
             books = await SearchBooks.load(router.searchQuery, store: model.books)
@@ -121,6 +123,12 @@ enum SearchBooks: Equatable {
     /// a server without books (LOCAL mode)
     case unavailable
     case failed(String)
+
+    /// What shows while a search waits out the typing: loading for words,
+    /// the prompt for none (never the last words' results).
+    static func waiting(for query: String) -> SearchBooks {
+        query.trimmingCharacters(in: .whitespaces).isEmpty ? .idle : .loading
+    }
 
     @MainActor static func load(_ query: String, store: BookStore) async -> SearchBooks {
         let q = query.trimmingCharacters(in: .whitespaces)
