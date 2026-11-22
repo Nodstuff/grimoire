@@ -12,7 +12,10 @@ import type { QueueRow } from '../types'
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 beforeEach(() => vi.useFakeTimers())
-afterEach(() => {
+const roots: { unmount: () => void }[] = []
+afterEach(async () => {
+  // a mounted queue keeps its window key listener: unmount every one
+  await act(async () => roots.splice(0).forEach((r) => r.unmount()))
   vi.useRealTimers()
   vi.unstubAllGlobals()
   document.body.innerHTML = ''
@@ -52,6 +55,7 @@ async function mount(dataVersion = 0) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const root = createRoot(el)
+  roots.push(root)
   const render = (dv: number) =>
     act(async () => root.render(<ReviewQueue onChange={() => {}} onOpenDoc={() => {}} dataVersion={dv} />))
   await render(dataVersion)
@@ -102,5 +106,57 @@ describe('review queue keys', () => {
     })
     expect(v.el.querySelectorAll('[data-sel="ann1"]').length).toBe(0)
     expect(v.el.querySelectorAll('[data-sel="ann2"]').length).toBe(1)
+  })
+})
+
+describe('the inline comment box', () => {
+  const setText = (ta: HTMLTextAreaElement, v: string) => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, v)
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+  const cmdEnter = (ta: HTMLTextAreaElement) => ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', metaKey: true, bubbles: true }))
+
+  it('⌘↵ twice posts the comment once (the box bypasses the disabled button)', async () => {
+    const s = server([yellowReplace('ann1', 'a', 'x', 'y')])
+    const v = await mount()
+    const open = [...v.el.querySelectorAll('button')].find((b) => b.textContent === 'Comment')!
+    await act(async () => open.click())
+    const ta = v.el.querySelector<HTMLTextAreaElement>('.rv-comment textarea')!
+    await act(async () => setText(ta, 'why this?'))
+    await act(async () => {
+      cmdEnter(ta)
+      cmdEnter(ta)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    expect(s.calls.filter((c) => c === 'POST /api/comment')).toHaveLength(1)
+  })
+
+  it('a comment sent while a resolve is in flight is held back (its text stays) and never clears that busy mark', async () => {
+    const s = server([yellowReplace('ann1', 'a', 'x', 'y'), yellowReplace('ann2', 'b', 'x', 'y')])
+    const v = await mount()
+    // the box under the second item (A resolves the first, selected one)
+    const open = [...v.el.querySelectorAll('button')].filter((b) => b.textContent === 'Comment').at(-1)!
+    await act(async () => open.click())
+    const ta = v.el.querySelector<HTMLTextAreaElement>('.rv-comment textarea')!
+    await act(async () => setText(ta, 'note'))
+    // the resolve's reload is slow
+    s.holdQueue = true
+    await act(async () => press('a'))
+    await act(async () => cmdEnter(ta))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    expect(s.calls.filter((c) => c === 'POST /api/comment')).toHaveLength(0)
+    expect(v.el.querySelector<HTMLTextAreaElement>('.rv-comment textarea')!.value).toBe('note')
+    // still busy: a second key does nothing
+    await act(async () => press('a'))
+    expect(resolves(s)).toBe(1)
+    s.holdQueue = false
+    await act(async () => {
+      s.held.forEach((r) => r())
+      await vi.advanceTimersByTimeAsync(10)
+    })
   })
 })

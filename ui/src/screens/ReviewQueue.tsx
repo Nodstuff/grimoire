@@ -113,10 +113,10 @@ export default function ReviewQueue({
   }
   /** a done action: its rows leave at once (so a key cannot hit them again),
    * and the busy mark stays until the reload has answered */
-  const finish = async (drop: (() => void) | null) => {
+  const finish = async (drop: (() => void) | null, reload = true) => {
     if (drop) drop()
     try {
-      await load()
+      if (reload) await load()
     } finally {
       busyRef.current = null
       setBusy(null)
@@ -174,7 +174,8 @@ export default function ReviewQueue({
   const postComment = async (blockId: string) => {
     const text = commentText.trim()
     if (!text) return
-    setBusy('comment')
+    // ⌘↵ in the box bypasses the disabled button: the same one-at-a-time guard
+    if (!begin('comment')) return
     try {
       await api('/api/comment', {
         method: 'POST',
@@ -187,7 +188,8 @@ export default function ReviewQueue({
     } catch (e) {
       notify(errText(e))
     }
-    setBusy(null)
+    // a comment changes no queue row: nothing to reload
+    await finish(null, false)
   }
 
   const docGroups = useMemo(() => groupByDoc(rows), [rows])
