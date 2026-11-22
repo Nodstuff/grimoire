@@ -4,6 +4,7 @@
 // keys; each screen lives in its own file (screens/, or the older top-level
 // ones: Home, Trash, BookLibrary, Settings, Gardeners, GraphView).
 
+import { flushAll } from './editor/registry'
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import Gardeners from './Gardeners'
 import { FirstRunName, loadProfile } from './Profile'
@@ -80,6 +81,18 @@ export interface OpenDocOpts {
   blockId?: string
 }
 export type OpenDoc = (id: string, opts?: string | OpenDocOpts) => void
+
+/** The reload shortcut: land every editor's unsaved typing first (the
+ * autosave waits 1.2 s after the last keystroke), and stay put if it
+ * cannot be saved. */
+export async function reloadAfterSaving(reload: () => void = () => location.reload()): Promise<boolean> {
+  if (!(await flushAll())) {
+    notify('not reloaded: an edit has not saved yet — it is kept here; try again once it saves', 'warn')
+    return false
+  }
+  reload()
+  return true
+}
 
 /** Sign out of the browser session, then reload onto the sign-in screen. */
 export function signOutAndReload(): void {
@@ -391,7 +404,7 @@ export default function App() {
           go({ kind: 'runs' })
           break
         case 'reload':
-          location.reload()
+          void reloadAfterSaving()
           break
         case 'back':
           goBack()

@@ -15,6 +15,7 @@ import { ReviewHighlight, ReviewMap, ReviewExtras, setReviewMap } from './Review
 import type { Node as PMNode } from '@tiptap/pm/model'
 import type { Transaction } from '@tiptap/pm/state'
 import { api, Block } from '../types'
+import { withCsrf } from '../auth'
 import { notify } from '../Notice'
 import { isPermanentSaveError, permanentSaveErrorText, saveErrorText } from '../hints'
 import { BaselineBlock, Entry, HiddenBlock, Op, computeOps } from './diff'
@@ -252,15 +253,15 @@ export default function DocEditor({
     if (editor.isEditable !== editable) editor.setEditable(editable, false)
   }, [editor, editable])
 
-  const runSave = async () => {
-    if (!editor || !editableRef.current) return
-    autosave.current.cancel()
-    // every new block gets its id here, before the diff, and the id goes on
-    // its node right away: the insert carries it, and an edit made while the
-    // request is in flight moves the node with its id (never pair inserts
-    // with id-less nodes in order — computeOps groups inserts by parent, so
-    // that pairing gave blocks each other's ids). A failed save keeps them,
-    // so its retry sends the same inserts.
+  /** Plan a save of what the editor holds now: every new block gets its id
+   * here, before the diff, and the id goes on its node right away. The
+   * insert carries it, and an edit made while the request is in flight moves
+   * the node with its id (never pair inserts with id-less nodes in order —
+   * computeOps groups inserts by parent, so that pairing gave blocks each
+   * other's ids). A failed save keeps them, so its retry sends the same
+   * inserts — under the same request_id. */
+  const prepare = () => {
+    if (!editor) return null
     const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [])
     if (stamps.length && !editor.isDestroyed) {
       const tr = editor.state.tr
@@ -269,17 +270,25 @@ export default function DocEditor({
       tr.setMeta(STAMP_META, true)
       editor.view.dispatch(tr)
     }
+    const base = epochRef.current
+    if (ops.length === 0) return { entries, ops, base, req: null }
+    const req = requestFor(pending.current, JSON.stringify({ doc_id: doc.docId, base_epoch: base, ops }))
+    pending.current = req
+    return { entries, ops, base, req }
+  }
+
+  const runSave = async () => {
+    if (!editor || !editableRef.current) return
+    autosave.current.cancel()
+    const { entries, ops, base, req } = prepare()!
     // what this save writes; edits landing while the request is in flight
     // make the doc differ from it, and the editor must stay dirty for them
     const snapshot = editor.state.doc
-    if (ops.length === 0) {
+    if (!req) {
       setSaveState('clean')
       return
     }
     setSaveState('saving')
-    const base = epochRef.current
-    const req = requestFor(pending.current, JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }))
-    pending.current = req
     try {
       const out = await api<{ epoch: number }>('/api/propose', {
         method: 'POST',
@@ -355,6 +364,46 @@ export default function DocEditor({
   }
   const flushRef = useRef(flush)
   flushRef.current = flush
+
+  // closing or reloading the tab: unsaved typing would be lost with the page
+  // (the debounce is 1.2 s). Ask first where the browser lets a page ask,
+  // and as the page goes, send what is unsaved with a keepalive request that
+  // outlives it. The same request_id as any later save of the same ops, so
+  // if the page stays after all (bfcache) nothing is applied twice. A save in
+  // flight is left to land: re-sending its ops would duplicate them.
+  const keepaliveRef = useRef<() => void>(() => {})
+  keepaliveRef.current = () => {
+    if (stateRef.current === 'clean' || inFlight.current || !editableRef.current || !editor) return
+    const plan = prepare()
+    if (!plan?.req) return
+    try {
+      void fetch(
+        '/api/propose',
+        withCsrf({
+          method: 'POST',
+          keepalive: true,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...JSON.parse(plan.req.body), request_id: plan.req.id }),
+        }),
+      ).catch(() => {})
+    } catch {
+      // no fetch (or keepalive refused, e.g. too large): the prompt was the guard
+    }
+  }
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (stateRef.current === 'clean' || !editableRef.current) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    const onPageHide = () => keepaliveRef.current()
+    window.addEventListener('beforeunload', onBeforeUnload)
+    window.addEventListener('pagehide', onPageHide)
+    return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      window.removeEventListener('pagehide', onPageHide)
+    }
+  }, [])
 
   useEffect(
     () =>
