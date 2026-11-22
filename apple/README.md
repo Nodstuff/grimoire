@@ -574,7 +574,16 @@ markdown after autosave. `LaunchTests` needs a doc titled "Welcome" headed
 - Outbox idempotency: main's daemon keeps `request_id` dedupe in memory for
   120 s (server-identity makes it durable for 7 days). Client-minted insert
   ids make a doubled insert fail instead of duplicating; `replace` and
-  `move` are idempotent; a doubled delete fails harmlessly.
+  `move` are idempotent; a doubled delete fails harmlessly. To-do writes
+  (`POST /api/todo*`) carry the row's key as `request_id` too (added at send
+  time; a server without it ignores the field). Every replay goes through
+  `AppModel.replayOutbox` (single-flight, behind the owner gate); a row in
+  flight is never claimed by a second replay, and one a killed app left in
+  flight is put back once when the cache opens (`Cache.releaseInflight`).
+- Agent turns page tie-safe on a server that numbers them (`seq`): top-ups
+  ask `after_seq=` from the cache's `synced_seq` (late replays arrive),
+  Earlier turns asks `before=` + `before_id=`. A server without `seq` is
+  paged as before (`after=` from the time watermark, `before=` oldest + 1).
 - `propose_markdown` queues are rebased like `propose`, but a stale base is
   an error there (whole-doc diff), so they are not chained.
 - Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
