@@ -222,6 +222,15 @@ fn web_session_row(r: &rusqlite::Row) -> rusqlite::Result<WebSession> {
     })
 }
 
+/// What a request authenticated with, by id (`auth_credential_live`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    Grant(Uuid),
+    ApiToken(Uuid),
+    WebSession(Uuid),
+    UploadToken(Uuid),
+}
+
 /// An OAuth client nobody signed in with is pruned this long after it was
 /// registered (`oauth_cleanup`).
 pub const UNUSED_CLIENT_TTL: i64 = 86400;
@@ -603,6 +612,35 @@ impl SqliteStore {
                 web_session_row,
             )
             .optional()?)
+    }
+
+    /// Is the credential a request authenticated with still live: the
+    /// grant unrevoked, the PAT or upload token unrevoked, the web session
+    /// inside its lifetimes, and its user still present? A long-lived
+    /// stream re-checks this to end itself once revoked (code review
+    /// 2026-11-22, item 3).
+    pub fn auth_credential_live(&self, c: Credential, now: i64) -> Result<bool> {
+        let unrevoked = |table: &str, id: Uuid| -> Result<bool> {
+            Ok(self.conn.query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1 AND revoked_at IS NULL
+                         AND user_id IN (SELECT id FROM auth_users))"
+                ),
+                [id.to_string()],
+                |r| r.get(0),
+            )?)
+        };
+        match c {
+            Credential::Grant(id) => unrevoked("oauth_grants", id),
+            Credential::ApiToken(id) => unrevoked("auth_api_tokens", id),
+            Credential::UploadToken(id) => unrevoked("upload_token", id),
+            Credential::WebSession(id) => Ok(self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM auth_web_sessions WHERE id = ?1 AND revoked_at IS NULL
+                     AND expires_at > ?2 AND last_used_at > ?2 - ?3 AND user_id IN (SELECT id FROM auth_users))",
+                params![id.to_string(), now, WEB_SESSION_IDLE],
+                |r| r.get(0),
+            )?),
+        }
     }
 
     /// Roll `last_used_at` forward, unless it moved in the last minute.
@@ -1451,6 +1489,27 @@ mod tests {
         );
         assert!(s.oauth_access_grant("a2", 212).unwrap().is_none());
         assert_eq!(s.oauth_grants(false).unwrap().len(), 0);
+    }
+
+    /// Code review 2026-11-22, item 3: what a stream re-checks.
+    #[test]
+    fn a_credential_is_live_until_revoked_or_lapsed() {
+        let (mut s, u) = store_with_owner();
+        let g = grant(&u, 100);
+        s.oauth_issue_grant(None, &g, "a1", 200, "r1", 300).unwrap();
+        assert!(s.auth_credential_live(Credential::Grant(g.id), 150).unwrap());
+        s.oauth_revoke_grant(&g.id.to_string(), "test", 160).unwrap();
+        assert!(!s.auth_credential_live(Credential::Grant(g.id), 170).unwrap());
+        let t = s.auth_create_api_token(u.id, "cc", "h1", 100).unwrap();
+        assert!(s.auth_credential_live(Credential::ApiToken(t.id), 150).unwrap());
+        s.auth_revoke_api_token("cc", 160).unwrap().unwrap();
+        assert!(!s.auth_credential_live(Credential::ApiToken(t.id), 170).unwrap());
+        let w = s.auth_create_web_session(u.id, None, "w1", "", 100).unwrap();
+        assert!(s.auth_credential_live(Credential::WebSession(w.id), 150).unwrap());
+        assert!(!s.auth_credential_live(Credential::WebSession(w.id), 100 + WEB_SESSION_IDLE + 1).unwrap(), "idle lapsed");
+        s.auth_revoke_web_session(&w.id.to_string(), 160).unwrap().unwrap();
+        assert!(!s.auth_credential_live(Credential::WebSession(w.id), 170).unwrap());
+        assert!(!s.auth_credential_live(Credential::Grant(Uuid::now_v7()), 170).unwrap(), "unknown is not live");
     }
 
     fn client(id: &str, at: i64) -> OAuthClient {

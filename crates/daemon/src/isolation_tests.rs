@@ -4073,3 +4073,43 @@ async fn a_connector_cannot_write_as_a_pats_principal_nor_vice_versa() {
         assert!(!is_err, "{label}: {out}");
     }
 }
+
+/// Code review 2026-11-22, item 3: a live stream ends once the grant it was
+/// opened with is revoked (re-checked every `STREAM_RECHECK`, 200 ms under
+/// test), on both the change feed and the fleet stream. A stream whose
+/// grant stays live keeps going.
+#[tokio::test]
+async fn a_stream_ends_once_its_grant_is_revoked() {
+    use futures_util::StreamExt;
+    let fx = fixture();
+    let open = |path: &'static str, token: String| {
+        let app = fx.app.clone();
+        async move {
+            let req = authed(Request::get(path).header("host", "localhost:7513"), &token, "GET").body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            res.into_body().into_data_stream()
+        }
+    };
+    // drains a body until it ends (true) or `wait` passes (false)
+    async fn ends_within(mut body: axum::body::BodyDataStream, wait: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, body.next()).await {
+                Ok(None) => return true,
+                Ok(Some(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+    let changes = open("/api/changes/stream?since=0", fx.b_app.clone()).await;
+    let fleet = open("/api/fabric/stream", fx.b_app.clone()).await;
+    // A's streams: her grant is untouched
+    let a_changes = open("/api/changes/stream?since=0", fx.a_app.clone()).await;
+    let revoked = fx.store.lock(Scope::System).oauth_revoke_by_token(&hash_secret(&fx.b_app), "test", now()).unwrap();
+    assert!(revoked.is_some());
+    let wait = std::time::Duration::from_secs(3);
+    assert!(ends_within(changes, wait).await, "the change feed outlived the revoke");
+    assert!(ends_within(fleet, wait).await, "the fleet stream outlived the revoke");
+    assert!(!ends_within(a_changes, std::time::Duration::from_millis(800)).await, "a live grant's stream keeps going");
+}

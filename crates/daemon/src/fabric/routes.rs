@@ -251,7 +251,12 @@ fn fleet_stream(
         .chain(stream::unfold(watcher, next_change))
 }
 
-async fn fleet_events(State(st): State<FabricState>, v: Viewer, headers: HeaderMap) -> Response {
+async fn fleet_events(
+    State(st): State<FabricState>,
+    v: Viewer,
+    who: Option<axum::Extension<crate::auth::Authenticated>>,
+    headers: HeaderMap,
+) -> Response {
     let (hub, user) = match gate(&st, &v, &headers) {
         Ok(g) => g,
         Err(r) => return r.into_response(),
@@ -260,7 +265,8 @@ async fn fleet_events(State(st): State<FabricState>, v: Viewer, headers: HeaderM
     // empty stream
     match hub.watch(user).await {
         Ok((fleet, rx)) => {
-            Sse::new(fleet_stream(fleet, rx)).keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping")).into_response()
+            let stream = crate::auth::until_revoked(fleet_stream(fleet, rx), hub.0.store.clone(), who.map(|w| w.0), crate::auth::STREAM_RECHECK);
+            Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping")).into_response()
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

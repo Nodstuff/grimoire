@@ -297,6 +297,7 @@ impl CimdMemory {
         self.held.insert(c.client_id.clone(), c);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.held.len()
     }
