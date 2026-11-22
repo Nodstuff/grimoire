@@ -47,6 +47,7 @@ fn turn(session: Uuid, id: &str, ended: i64) -> FabricTurn {
         source: "mac".into(),
         order_id: None,
         created_at: ended,
+        seq: 0,
     }
 }
 
@@ -198,6 +199,45 @@ fn compound_cursors_page_same_second_turns_without_loss() {
     w.s.with_scope_for_test(Scope::User(w.ann), |s| {
         assert!(nf(s.fabric_turns_before(w.rt, sid, 200, "s3", 10)));
         assert!(nf(s.fabric_turns_after_id(w.rt, sid, 200, "s3", 10)));
+    });
+}
+
+/// A replayed turn (the runtime's `ended` is in the past) lands behind a
+/// client's `ended` cursor; the insertion sequence still hands it over, in
+/// the order turns were stored. The newest-stored turn survives the prune,
+/// so `seq` never repeats.
+#[test]
+fn the_insertion_sequence_hands_over_a_replayed_turn() {
+    let mut w = setup();
+    let sid = Uuid::now_v7();
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        let a = s.fabric_turn_put_seq(w.rt, &turn(sid, "a", 100)).unwrap().unwrap();
+        let b = s.fabric_turn_put_seq(w.rt, &turn(sid, "b", 300)).unwrap().unwrap();
+        assert!(b > a);
+        assert_eq!(s.fabric_turn_put_seq(w.rt, &turn(sid, "b", 300)).unwrap(), None, "a replay is not stored again");
+        // the client holds a and b (cursor: ended 300 / seq b); a turn that
+        // ended at 200 arrives late
+        let late = s.fabric_turn_put_seq(w.rt, &turn(sid, "late", 200)).unwrap().unwrap();
+        assert!(s.fabric_turns_after(w.rt, sid, 300, 10).unwrap().is_empty(), "the ended cursor cannot see it");
+        let got = s.fabric_turns_after_seq(w.rt, sid, b, 10).unwrap();
+        assert_eq!((got.len(), got[0].turn_id.as_str(), got[0].seq), (1, "late", late));
+        assert_eq!(s.fabric_turns_since_seq(b, 10).unwrap()[0].turn_id, "late");
+        assert_eq!(s.fabric_turns(w.rt, sid, None, 10).unwrap()[0].seq, b, "reads carry seq");
+    });
+    w.s.with_scope_for_test(Scope::User(w.ann), |s| {
+        assert!(nf(s.fabric_turns_after_seq(w.rt, sid, 0, 10)));
+        assert!(s.fabric_turns_since_seq(0, 10).unwrap().is_empty());
+    });
+    w.s.with_scope_for_test(Scope::Public, |s| assert!(nf(s.fabric_turns_since_seq(0, 10))));
+    // past retention every turn goes but the newest-stored, so the next
+    // seq is still higher than any handed out
+    let far = 10 * WORK_RETENTION;
+    w.s.with_scope_for_test(Scope::System, |s| s.fabric_work_expire(far).unwrap());
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        let left = s.fabric_turns(w.rt, sid, None, 10).unwrap();
+        assert_eq!(left.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(), ["late"]);
+        let next = s.fabric_turn_put_seq(w.rt, &turn(sid, "next", far)).unwrap().unwrap();
+        assert!(next > left[0].seq);
     });
 }
 

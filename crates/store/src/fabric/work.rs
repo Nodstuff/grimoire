@@ -65,6 +65,10 @@ pub struct FabricTurn {
     pub source: String,
     pub order_id: Option<String>,
     pub created_at: i64,
+    /// The server's insertion sequence: increases with every turn stored,
+    /// whatever its `ended` (a replayed turn's `ended` is in the past). 0 on
+    /// a turn not read back from the store.
+    pub seq: i64,
 }
 
 const TURN_COLS: &str = "runtime_id, session_id, user_id, turn_id, address, project, prompt, reply, text_off, tool_count, \
@@ -92,6 +96,7 @@ fn turn_row(r: &Row) -> rusqlite::Result<FabricTurn> {
         source: r.get(16)?,
         order_id: r.get(17)?,
         created_at: r.get(18)?,
+        seq: r.get::<_, Option<i64>>(19)?.unwrap_or(0),
     })
 }
 
@@ -346,10 +351,16 @@ impl SqliteStore {
     /// Store a turn of one of the scope's runtimes, keyed to it and its
     /// owner. A turn already held (a replay) is left as it is: false.
     pub fn fabric_turn_put(&mut self, runtime: Uuid, t: &FabricTurn) -> Result<bool> {
+        Ok(self.fabric_turn_put_seq(runtime, t)?.is_some())
+    }
+
+    /// `fabric_turn_put`, answering the new turn's `seq` (None: a replay).
+    pub fn fabric_turn_put_seq(&mut self, runtime: Uuid, t: &FabricTurn) -> Result<Option<i64>> {
         let owner = self.fabric_runtime(runtime)?.user_id;
         let n = self.conn.execute(
             &format!(
-                "INSERT INTO fabric_turns ({TURN_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                "INSERT INTO fabric_turns ({TURN_COLS}, seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM fabric_turns))
                  ON CONFLICT (runtime_id, session_id, turn_id) DO NOTHING"
             ),
             params![
@@ -374,7 +385,14 @@ impl SqliteStore {
                 t.created_at
             ],
         )?;
-        Ok(n == 1)
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.conn.query_row(
+            "SELECT seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND turn_id = ?3",
+            params![runtime.to_string(), t.session_id.to_string(), t.turn_id],
+            |r| r.get(0),
+        )?))
     }
 
     /// One session's turns, newest first, ended before `before` when given.
@@ -382,7 +400,7 @@ impl SqliteStore {
     pub fn fabric_turns(&self, runtime: Uuid, session: Uuid, before: Option<i64>, limit: usize) -> Result<Vec<FabricTurn>> {
         self.fabric_runtime(runtime)?;
         let mut st = self.conn.prepare(&format!(
-            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND (?3 IS NULL OR ended < ?3)
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND (?3 IS NULL OR ended < ?3)
              ORDER BY ended DESC, created_at DESC, turn_id DESC LIMIT ?4"
         ))?;
         let rows = st.query_map(params![runtime.to_string(), session.to_string(), before, limit as i64], turn_row)?;
@@ -415,7 +433,7 @@ impl SqliteStore {
             return self.fabric_turns(runtime, session, Some(before), limit);
         };
         let mut st = self.conn.prepare(&format!(
-            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2
                  AND (ended, created_at, turn_id) < (?3, ?4, ?5)
              ORDER BY ended DESC, created_at DESC, turn_id DESC LIMIT ?6"
         ))?;
@@ -436,7 +454,7 @@ impl SqliteStore {
             return self.fabric_turns_after(runtime, session, after, limit);
         };
         let mut st = self.conn.prepare(&format!(
-            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2
                  AND (ended, created_at, turn_id) > (?3, ?4, ?5)
              ORDER BY ended, created_at, turn_id LIMIT ?6"
         ))?;
@@ -453,10 +471,36 @@ impl SqliteStore {
     pub fn fabric_turns_after(&self, runtime: Uuid, session: Uuid, after: i64, limit: usize) -> Result<Vec<FabricTurn>> {
         self.fabric_runtime(runtime)?;
         let mut st = self.conn.prepare(&format!(
-            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND ended > ?3
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND ended > ?3
              ORDER BY ended, created_at, turn_id LIMIT ?4"
         ))?;
         let rows = st.query_map(params![runtime.to_string(), session.to_string(), after, limit as i64], turn_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One session's turns stored after `seq` (the insertion sequence), in
+    /// the order they were stored: what a client holding every turn up to
+    /// `seq` is missing, a replayed turn whose `ended` is in the past
+    /// included (code review 2026-11-22, item 4). NotFound as `fabric_turns`.
+    pub fn fabric_turns_after_seq(&self, runtime: Uuid, session: Uuid, seq: i64, limit: usize) -> Result<Vec<FabricTurn>> {
+        self.fabric_runtime(runtime)?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND seq > ?3
+             ORDER BY seq LIMIT ?4"
+        ))?;
+        let rows = st.query_map(params![runtime.to_string(), session.to_string(), seq, limit as i64], turn_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every turn of the scope's fleet stored after `seq`, in the order
+    /// they were stored (`fabric_turns_after_seq` across sessions).
+    pub fn fabric_turns_since_seq(&self, seq: i64, limit: usize) -> Result<Vec<FabricTurn>> {
+        let Some(user) = self.fleet()?.filter() else { return Ok(vec![]) };
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE (?1 IS NULL OR user_id = ?1) AND seq > ?2
+             ORDER BY seq LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![user, seq, limit as i64], turn_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -464,7 +508,7 @@ impl SqliteStore {
     pub fn fabric_turns_since(&self, since: i64, limit: usize) -> Result<Vec<FabricTurn>> {
         let Some(user) = self.fleet()?.filter() else { return Ok(vec![]) };
         let mut st = self.conn.prepare(&format!(
-            "SELECT {TURN_COLS} FROM fabric_turns WHERE (?1 IS NULL OR user_id = ?1) AND ended > ?2
+            "SELECT {TURN_COLS}, seq FROM fabric_turns WHERE (?1 IS NULL OR user_id = ?1) AND ended > ?2
              ORDER BY ended, created_at LIMIT ?3"
         ))?;
         let rows = st.query_map(params![user, since, limit as i64], turn_row)?;
@@ -1097,7 +1141,12 @@ impl SqliteStore {
             let rows = st.query_map([now], pairing_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        tx.execute("DELETE FROM fabric_turns WHERE ended < ?1", [cutoff])?;
+        // the newest-stored turn stays (even if a replay made it old), so
+        // `seq` never goes back and is never handed out twice
+        tx.execute(
+            "DELETE FROM fabric_turns WHERE ended < ?1 AND seq < (SELECT COALESCE(MAX(seq), 0) FROM fabric_turns)",
+            [cutoff],
+        )?;
         tx.execute("DELETE FROM fabric_orders WHERE updated_at < ?1", [cutoff])?;
         tx.execute("DELETE FROM fabric_attention WHERE updated_at < ?1", [cutoff])?;
         tx.execute("DELETE FROM fabric_pairings WHERE created_at < ?1", [now - PAIRING_ROW_RETENTION])?;

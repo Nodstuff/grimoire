@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS fabric_turns (
     source           TEXT NOT NULL DEFAULT 'unknown',
     order_id         TEXT,
     created_at       INTEGER NOT NULL,
+    -- the insertion sequence (MAX + 1 at insert; v17 numbered older rows in
+    -- rowid order): a cursor that a replayed turn's past `ended` cannot dodge.
+    -- Its index is created by the v17 migration (sqlite.rs), after the
+    -- column exists on an older database.
+    seq              INTEGER,
     PRIMARY KEY (runtime_id, session_id, turn_id)
 );
 CREATE INDEX IF NOT EXISTS fabric_turns_user_ended ON fabric_turns (user_id, ended);

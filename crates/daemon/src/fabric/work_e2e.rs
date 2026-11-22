@@ -166,6 +166,17 @@ async fn turns_after_top_up_a_held_feed_oldest_first() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     let (st, _) = t.send("GET", &format!("{path}?after_id=a1"), None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "an _id needs its time");
+    // the insertion sequence: every turn carries seq; after_seq is what was
+    // stored since, in stored order (a replayed turn's past ended included)
+    let seqs: Vec<i64> = all["turns"].as_array().unwrap().iter().map(|t| t["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.iter().all(|s| *s > 0), "{all}");
+    let min = *seqs.iter().min().unwrap();
+    let rest = t.get(&format!("{path}?after_seq={min}")).await;
+    assert_eq!(rest["turns"].as_array().map(Vec::len), Some(2), "{rest}");
+    let since = t.get(&format!("/api/fabric/turns?since_seq={min}")).await;
+    assert_eq!(since["turns"].as_array().map(Vec::len), Some(2), "{since}");
+    let (st, _) = t.send("GET", &format!("{path}?after_seq=0&after=0"), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "after_seq stands alone");
 }
 
 #[tokio::test]

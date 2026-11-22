@@ -91,6 +91,8 @@ impl SqliteStore {
         ] {
             add_column_if_missing(&conn, "fabric_sessions", col, decl)?;
         }
+        // v17: the turns' insertion sequence (fabric.sql)
+        add_column_if_missing(&conn, "fabric_turns", "seq", "INTEGER")?;
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
@@ -521,7 +523,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -596,6 +598,15 @@ fn backfill(conn: &Connection) -> Result<()> {
     // for ADR 0008 the turns, attention, orders, settings, projects,
     // pairings, conversations and messages tables). Created IF NOT EXISTS
     // by init, the later columns added when missing; nothing to backfill.
+    if version < 17 {
+        // v17: Agent Fabric turns get an insertion sequence (the column is
+        // added by init when missing): the rows already held are numbered
+        // in the order they were stored, and the column is indexed
+        tx.execute_batch(
+            "UPDATE fabric_turns SET seq = rowid WHERE seq IS NULL;
+             CREATE INDEX IF NOT EXISTS fabric_turns_seq ON fabric_turns (seq);",
+        )?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -4882,6 +4893,50 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// v17: a v16 database's Agent Fabric turns get their insertion
+    /// sequence, numbered in the order they were stored, and the index.
+    #[test]
+    fn v17_numbers_existing_turns_in_stored_order() {
+        use crate::{BlockStore, PrincipalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let (rt, sid) = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let tom = s.auth_ensure_owner(p, "tom", 1).unwrap().id;
+            let rt = s.fabric_runtime_create(tom, "mbp", "h1", 1).unwrap().id;
+            let sid = Uuid::now_v7();
+            for (id, ended) in [("first", 300), ("second", 100)] {
+                s.conn
+                    .execute(
+                        "INSERT INTO fabric_turns (runtime_id, session_id, turn_id, user_id, started, ended, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+                        params![rt.to_string(), sid.to_string(), id, tom.to_string(), ended],
+                    )
+                    .unwrap();
+            }
+            // back to a v16 file: no column, no index
+            s.conn
+                .execute_batch("DROP INDEX fabric_turns_seq; ALTER TABLE fabric_turns DROP COLUMN seq; PRAGMA user_version = 16;")
+                .unwrap();
+            (rt, sid)
+        };
+        let mut s = SqliteStore::open(&path).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let idx: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'fabric_turns_seq'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(idx, 1);
+        let got = s.fabric_turns_after_seq(rt, sid, 0, 10).unwrap();
+        assert_eq!(got.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(), ["first", "second"], "stored order, not ended");
+        assert!(got[0].seq > 0 && got[1].seq > got[0].seq);
+        let t = crate::fabric::FabricTurn { turn_id: "third".into(), seq: 0, ..got[0].clone() };
+        let next = s.fabric_turn_put_seq(rt, &t).unwrap().unwrap();
+        assert!(next > got[1].seq);
     }
 
     /// v7: reviewer gardeners are disabled once (rows and runs kept), and no

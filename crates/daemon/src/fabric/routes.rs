@@ -353,6 +353,12 @@ struct Page {
     after: Option<i64>,
     /// With `after`: the turn_id of the newest turn held (ended at `after`).
     after_id: Option<String>,
+    /// Turns: the highest `seq` held. The page is the turns stored after it,
+    /// in the order they were stored, a replayed turn whose `ended` is in
+    /// the past included. Alone (not with before/after).
+    after_seq: Option<i64>,
+    /// `/api/fabric/turns`: the same, across the fleet (instead of `since`).
+    since_seq: Option<i64>,
     since: Option<i64>,
     limit: Option<usize>,
     runtime_id: Option<Uuid>,
@@ -375,11 +381,15 @@ async fn session_turns(
     if (q.before_id.is_some() && before.is_none()) || (q.after_id.is_some() && after.is_none()) {
         return error(StatusCode::BAD_REQUEST, "before_id needs before, after_id needs after");
     }
-    let (before_id, after_id) = (q.before_id, q.after_id);
+    if q.after_seq.is_some() && (before.is_some() || after.is_some()) {
+        return error(StatusCode::BAD_REQUEST, "after_seq stands alone");
+    }
+    let (before_id, after_id, after_seq) = (q.before_id, q.after_id, q.after_seq);
     // `after`: the turns ended since, oldest first (a client topping up what
     // it holds); otherwise the newest page, newest first. With `_id` the
     // cursor is that exact turn (ADR 0008), so same-second turns survive.
     let read = move |s: &mut taisce_store::SqliteStore| match (after, after_id, before, before_id) {
+        _ if after_seq.is_some() => s.fabric_turns_after_seq(runtime, session, after_seq.unwrap_or(0), limit + 1),
         (Some(after), Some(id), _, _) => s.fabric_turns_after_id(runtime, session, after, &id, limit + 1),
         (Some(after), None, _, _) => s.fabric_turns_after(runtime, session, after, limit + 1),
         (None, _, Some(before), Some(id)) => s.fabric_turns_before(runtime, session, before, &id, limit + 1),
@@ -398,7 +408,15 @@ async fn session_turns(
 async fn turns_since(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, Query(q): Query<Page>) -> Response {
     let (hub, user) = gated!(st, v, headers);
     let (since, limit) = (q.since.unwrap_or(0), q.limit.unwrap_or(100).clamp(1, 200));
-    match with_store(&hub.0.store, Scope::User(user), move |s| s.fabric_turns_since(since, limit)).await {
+    if q.since.is_some() && q.since_seq.is_some() {
+        return error(StatusCode::BAD_REQUEST, "since or since_seq, not both");
+    }
+    let since_seq = q.since_seq;
+    let read = move |s: &mut taisce_store::SqliteStore| match since_seq {
+        Some(seq) => s.fabric_turns_since_seq(seq, limit),
+        None => s.fabric_turns_since(since, limit),
+    };
+    match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(turns) => Json(json!({"turns": turns.iter().map(TurnView::from).collect::<Vec<_>>()})).into_response(),
         Err(e) => store_error(e),
     }
