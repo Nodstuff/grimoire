@@ -383,9 +383,67 @@ impl SqliteStore {
         self.fabric_runtime(runtime)?;
         let mut st = self.conn.prepare(&format!(
             "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND (?3 IS NULL OR ended < ?3)
-             ORDER BY ended DESC, created_at DESC LIMIT ?4"
+             ORDER BY ended DESC, created_at DESC, turn_id DESC LIMIT ?4"
         ))?;
         let rows = st.query_map(params![runtime.to_string(), session.to_string(), before, limit as i64], turn_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The `created_at` of one of a session's turns: the middle key of the
+    /// `(ended, created_at, turn_id)` order a `before_id` / `after_id`
+    /// cursor stands on. None when the turn is gone.
+    fn turn_created_at(&self, runtime: Uuid, session: Uuid, turn_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT created_at FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND turn_id = ?3",
+                params![runtime.to_string(), session.to_string(), turn_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `fabric_turns` from a compound cursor: the turns strictly older than
+    /// turn `before_id` (which ended at `before`) in the one order every
+    /// page uses, `(ended, created_at, turn_id)` newest first. Turns that
+    /// ended in the same second as the cursor are no longer skipped (code
+    /// review 2026-11-22, item 4). A cursor turn that is gone (pruned) falls
+    /// back to `ended < before`, exactly `fabric_turns`.
+    pub fn fabric_turns_before(&self, runtime: Uuid, session: Uuid, before: i64, before_id: &str, limit: usize) -> Result<Vec<FabricTurn>> {
+        self.fabric_runtime(runtime)?;
+        let Some(created) = self.turn_created_at(runtime, session, before_id)? else {
+            return self.fabric_turns(runtime, session, Some(before), limit);
+        };
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2
+                 AND (ended, created_at, turn_id) < (?3, ?4, ?5)
+             ORDER BY ended DESC, created_at DESC, turn_id DESC LIMIT ?6"
+        ))?;
+        let rows = st.query_map(
+            params![runtime.to_string(), session.to_string(), before, created, before_id, limit as i64],
+            turn_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// `fabric_turns_after` from a compound cursor: the turns strictly newer
+    /// than turn `after_id` (which ended at `after`), oldest first, in the
+    /// same `(ended, created_at, turn_id)` order. A cursor turn that is gone
+    /// falls back to `ended > after`, exactly `fabric_turns_after`.
+    pub fn fabric_turns_after_id(&self, runtime: Uuid, session: Uuid, after: i64, after_id: &str, limit: usize) -> Result<Vec<FabricTurn>> {
+        self.fabric_runtime(runtime)?;
+        let Some(created) = self.turn_created_at(runtime, session, after_id)? else {
+            return self.fabric_turns_after(runtime, session, after, limit);
+        };
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2
+                 AND (ended, created_at, turn_id) > (?3, ?4, ?5)
+             ORDER BY ended, created_at, turn_id LIMIT ?6"
+        ))?;
+        let rows = st.query_map(
+            params![runtime.to_string(), session.to_string(), after, created, after_id, limit as i64],
+            turn_row,
+        )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -396,7 +454,7 @@ impl SqliteStore {
         self.fabric_runtime(runtime)?;
         let mut st = self.conn.prepare(&format!(
             "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND ended > ?3
-             ORDER BY ended, created_at LIMIT ?4"
+             ORDER BY ended, created_at, turn_id LIMIT ?4"
         ))?;
         let rows = st.query_map(params![runtime.to_string(), session.to_string(), after, limit as i64], turn_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -639,6 +697,46 @@ impl SqliteStore {
         ))?;
         let rows = st.query_map(
             params![user, runtime.map(|r| r.to_string()), session.map(|s| s.to_string()), before, limit as i64],
+            order_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// `fabric_orders` from a compound cursor: the orders strictly older
+    /// than order `before_id` (created at `before`) in the order every page
+    /// uses, `(created_at, rowid)` newest first, so orders created in the
+    /// same second are no longer skipped (code review 2026-11-22, item 4).
+    /// An order id not found among the scope's (gone, or never theirs)
+    /// falls back to `created_at < before`, exactly `fabric_orders`.
+    pub fn fabric_orders_before(
+        &self,
+        runtime: Option<Uuid>,
+        session: Option<Uuid>,
+        before: i64,
+        before_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FabricOrder>> {
+        let Some(user) = self.fleet()?.filter() else { return Ok(vec![]) };
+        let rowid: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rowid FROM fabric_orders WHERE id = ?1 AND created_at = ?2 AND (?3 IS NULL OR user_id = ?3)
+                     AND (?4 IS NULL OR runtime_id = ?4)
+                 ORDER BY rowid DESC LIMIT 1",
+                params![before_id, before, user, runtime.map(|r| r.to_string())],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(rowid) = rowid else {
+            return self.fabric_orders(runtime, session, Some(before), limit);
+        };
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {ORDER_COLS} FROM fabric_orders WHERE (?1 IS NULL OR user_id = ?1) AND (?2 IS NULL OR runtime_id = ?2)
+                 AND (?3 IS NULL OR session_id = ?3) AND (created_at, rowid) < (?4, ?5)
+             ORDER BY created_at DESC, rowid DESC LIMIT ?6"
+        ))?;
+        let rows = st.query_map(
+            params![user, runtime.map(|r| r.to_string()), session.map(|s| s.to_string()), before, rowid, limit as i64],
             order_row,
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

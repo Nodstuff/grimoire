@@ -345,7 +345,14 @@ async fn unfollow(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, 
 #[derive(serde::Deserialize)]
 struct Page {
     before: Option<i64>,
+    /// With `before`: the turn_id (orders: the order id) of the oldest row
+    /// held, which ended (was created) at `before`. The page is then the
+    /// rows strictly older than that row, so same-second rows are not
+    /// skipped. Without it, `before` alone is `ended < before`, as ever.
+    before_id: Option<String>,
     after: Option<i64>,
+    /// With `after`: the turn_id of the newest turn held (ended at `after`).
+    after_id: Option<String>,
     since: Option<i64>,
     limit: Option<usize>,
     runtime_id: Option<Uuid>,
@@ -365,11 +372,18 @@ async fn session_turns(
     if before.is_some() && after.is_some() {
         return error(StatusCode::BAD_REQUEST, "before or after, not both");
     }
+    if (q.before_id.is_some() && before.is_none()) || (q.after_id.is_some() && after.is_none()) {
+        return error(StatusCode::BAD_REQUEST, "before_id needs before, after_id needs after");
+    }
+    let (before_id, after_id) = (q.before_id, q.after_id);
     // `after`: the turns ended since, oldest first (a client topping up what
-    // it holds); otherwise the newest page, newest first
-    let read = move |s: &mut taisce_store::SqliteStore| match after {
-        Some(after) => s.fabric_turns_after(runtime, session, after, limit + 1),
-        None => s.fabric_turns(runtime, session, before, limit + 1),
+    // it holds); otherwise the newest page, newest first. With `_id` the
+    // cursor is that exact turn (ADR 0008), so same-second turns survive.
+    let read = move |s: &mut taisce_store::SqliteStore| match (after, after_id, before, before_id) {
+        (Some(after), Some(id), _, _) => s.fabric_turns_after_id(runtime, session, after, &id, limit + 1),
+        (Some(after), None, _, _) => s.fabric_turns_after(runtime, session, after, limit + 1),
+        (None, _, Some(before), Some(id)) => s.fabric_turns_before(runtime, session, before, &id, limit + 1),
+        (None, _, before, _) => s.fabric_turns(runtime, session, before, limit + 1),
     };
     match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(mut turns) => {
@@ -422,7 +436,14 @@ async fn submit_order(State(st): State<FabricState>, v: Viewer, headers: HeaderM
 async fn orders(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, Query(q): Query<Page>) -> Response {
     let (hub, user) = gated!(st, v, headers);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    match with_store(&hub.0.store, Scope::User(user), move |s| s.fabric_orders(q.runtime_id, q.session_id, q.before, limit)).await {
+    if q.before_id.is_some() && q.before.is_none() {
+        return error(StatusCode::BAD_REQUEST, "before_id needs before");
+    }
+    let read = move |s: &mut taisce_store::SqliteStore| match (q.before, q.before_id.as_deref()) {
+        (Some(before), Some(id)) => s.fabric_orders_before(q.runtime_id, q.session_id, before, id, limit),
+        (before, _) => s.fabric_orders(q.runtime_id, q.session_id, before, limit),
+    };
+    match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(orders) => Json(json!({"orders": orders.iter().map(OrderView::from).collect::<Vec<_>>()})).into_response(),
         Err(e) => store_error(e),
     }

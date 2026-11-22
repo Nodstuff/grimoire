@@ -3932,10 +3932,17 @@ async fn agent_fabric_work_is_its_owners_alone() {
         assert_eq!(st, StatusCode::OK, "{path}: {out}");
         blank(path, &out);
     }
+    // A's order id is no cursor into anything of hers
+    let path = format!("/api/fabric/orders?before=9999999999&before_id={a_order}");
+    let (st, out) = fx.b("GET", &path, None).await;
+    assert_eq!(st, StatusCode::OK, "{path}: {out}");
+    blank(&path, &out);
     // A's things by id: not found, never forbidden
     for path in [
         format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns"),
         format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?after=0"),
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?after=0&after_id=t1"),
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?before=9999999999&before_id=t1"),
         format!("/api/fabric/orders/{a_order}"),
         format!("/api/fabric/pairing/{a_pairing}"),
         format!("/api/fabric/conversations/{a_conv}"),
