@@ -488,40 +488,127 @@ pub fn spec_key(spec: &BookSpec) -> String {
     hex::encode(h.finalize())
 }
 
-/// A small in-memory cache of rendered books by [`spec_key`]: a reader's
-/// HEAD-then-GET, and the feed's sizes, render once.
+/// An in-memory cache of rendered books by [`spec_key`] (content-addressed:
+/// a hit needs the spec itself, so sharing bytes across people leaks
+/// nothing): a reader's HEAD-then-GET renders once. Each entry remembers who
+/// rendered it, and one person holds at most [`PER_USER_ENTRIES`], so one
+/// long list cannot evict everyone else's books. Sizes are remembered apart
+/// from the bytes ([`RenderCache::size_of`]), so a feed or list whose books
+/// were rendered before answers without rendering again (code review
+/// 2026-11-22, item 5).
 pub struct RenderCache {
-    entries: std::sync::Mutex<std::collections::VecDeque<(String, std::sync::Arc<Vec<u8>>)>>,
+    inner: std::sync::Mutex<CacheInner>,
+    /// renders done (tests)
+    renders: std::sync::atomic::AtomicUsize,
 }
 
-const CACHE_ENTRIES: usize = 16;
+#[derive(Default)]
+struct CacheInner {
+    /// most recent first: (key, who rendered it, bytes)
+    entries: std::collections::VecDeque<(String, Option<Uuid>, std::sync::Arc<Vec<u8>>)>,
+    /// spec_key → rendered length, most recent last (bounded by SIZE_ENTRIES)
+    sizes: std::collections::BTreeMap<String, usize>,
+    size_order: std::collections::VecDeque<String>,
+}
+
+const CACHE_ENTRIES: usize = 64;
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// One person's share of the entries.
+pub const PER_USER_ENTRIES: usize = 16;
+/// Remembered sizes (a key and a number each).
+const SIZE_ENTRIES: usize = 4096;
 
 impl RenderCache {
     pub const fn new() -> Self {
-        Self { entries: std::sync::Mutex::new(std::collections::VecDeque::new()) }
+        Self {
+            inner: std::sync::Mutex::new(CacheInner {
+                entries: std::collections::VecDeque::new(),
+                sizes: std::collections::BTreeMap::new(),
+                size_order: std::collections::VecDeque::new(),
+            }),
+            renders: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
-    /// The rendered bytes of `spec`, from the cache or freshly made.
-    pub fn get_or_render(&self, spec: &BookSpec) -> anyhow::Result<std::sync::Arc<Vec<u8>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The rendered bytes of `spec`, from the cache or freshly made, kept
+    /// under `user`'s share. Blocking: async callers use [`render_async`].
+    pub fn get_or_render(&self, spec: &BookSpec, user: Option<Uuid>) -> anyhow::Result<std::sync::Arc<Vec<u8>>> {
         let key = spec_key(spec);
-        {
-            let mut e = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(pos) = e.iter().position(|(k, _)| *k == key) {
-                let hit = e.remove(pos).expect("present");
-                let bytes = hit.1.clone();
-                e.push_front(hit);
-                return Ok(bytes);
-            }
+        if let Some(bytes) = self.hit(&key) {
+            return Ok(bytes);
         }
+        self.renders.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = std::sync::Arc::new(render(spec)?);
-        let mut e = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        e.push_front((key, bytes.clone()));
-        while e.len() > CACHE_ENTRIES || (e.len() > 1 && e.iter().map(|(_, b)| b.len()).sum::<usize>() > CACHE_BYTES) {
-            e.pop_back();
+        let mut c = self.lock();
+        remember_size(&mut c, &key, bytes.len());
+        c.entries.push_front((key, user, bytes.clone()));
+        // this person's oldest beyond their share, then anyone's beyond the
+        // whole cache's bounds (never the entry just made)
+        let mine: Vec<usize> = c.entries.iter().enumerate().filter(|(_, (_, u, _))| *u == user).map(|(i, _)| i).collect();
+        if mine.len() > PER_USER_ENTRIES
+            && let Some(&oldest) = mine.last()
+        {
+            c.entries.remove(oldest);
+        }
+        while c.entries.len() > CACHE_ENTRIES || (c.entries.len() > 1 && c.entries.iter().map(|(_, _, b)| b.len()).sum::<usize>() > CACHE_BYTES) {
+            c.entries.pop_back();
         }
         Ok(bytes)
     }
+
+    fn hit(&self, key: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        let mut c = self.lock();
+        let pos = c.entries.iter().position(|(k, _, _)| k == key)?;
+        let hit = c.entries.remove(pos).expect("present");
+        let bytes = hit.2.clone();
+        c.entries.push_front(hit);
+        Some(bytes)
+    }
+
+    /// The rendered length of `spec`: remembered from an earlier render
+    /// (even one whose bytes have since been evicted), else rendered now.
+    pub fn size_of(&self, spec: &BookSpec, user: Option<Uuid>) -> anyhow::Result<usize> {
+        let key = spec_key(spec);
+        if let Some(n) = self.lock().sizes.get(&key).copied() {
+            return Ok(n);
+        }
+        Ok(self.get_or_render(spec, user)?.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn renders(&self) -> usize {
+        self.renders.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn remember_size(c: &mut CacheInner, key: &str, n: usize) {
+    if c.sizes.insert(key.to_string(), n).is_none() {
+        c.size_order.push_back(key.to_string());
+        while c.size_order.len() > SIZE_ENTRIES {
+            if let Some(old) = c.size_order.pop_front() {
+                c.sizes.remove(&old);
+            }
+        }
+    }
+}
+
+/// [`RenderCache::get_or_render`] on the process cache, off the async
+/// workers: a render is CPU work (Markdown, XHTML, zip) that must not stall
+/// every other request on the runtime.
+pub async fn render_async(spec: BookSpec, user: Option<Uuid>) -> anyhow::Result<std::sync::Arc<Vec<u8>>> {
+    tokio::task::spawn_blocking(move || CACHE.get_or_render(&spec, user)).await.map_err(|e| anyhow::anyhow!("render task: {e}"))?
+}
+
+/// The rendered sizes of `specs` (in order) on the process cache, off the
+/// async workers; a remembered size costs no render.
+pub async fn sizes_async(specs: Vec<BookSpec>, user: Option<Uuid>) -> anyhow::Result<Vec<usize>> {
+    tokio::task::spawn_blocking(move || specs.iter().map(|s| CACHE.size_of(s, user)).collect::<anyhow::Result<Vec<_>>>())
+        .await
+        .map_err(|e| anyhow::anyhow!("render task: {e}"))?
 }
 
 /// The process's render cache.
@@ -716,8 +803,50 @@ pub(crate) mod tests {
         assert_ne!(render(&changed).unwrap(), a);
         assert_ne!(spec_key(&changed), spec_key(&sample()));
         // the cache hands back the same bytes
-        let c = CACHE.get_or_render(&sample()).unwrap();
+        let c = CACHE.get_or_render(&sample(), None).unwrap();
         assert_eq!(*c, a);
+    }
+
+    /// Code review 2026-11-22, item 5: one person's long list no longer
+    /// evicts another's books, and a size, once rendered, is answered
+    /// without rendering again (even after the bytes were evicted).
+    #[test]
+    fn the_cache_keeps_a_share_per_person_and_remembers_sizes() {
+        let cache = RenderCache::new();
+        let (a, b) = (Some(Uuid::from_u128(1)), Some(Uuid::from_u128(2)));
+        let spec = |i: usize| {
+            let mut s = sample();
+            s.id = Uuid::from_u128(1000 + i as u128);
+            s.chapters[0].blocks[1].markdown.push_str(&format!(" {i}"));
+            s
+        };
+        let b_book = spec(0);
+        let b_size = cache.size_of(&b_book, b).unwrap();
+        assert_eq!(cache.renders(), 1);
+        // A renders more books than her share: her oldest go, B's stays
+        for i in 1..=PER_USER_ENTRIES + 4 {
+            cache.get_or_render(&spec(i), a).unwrap();
+        }
+        let before = cache.renders();
+        cache.get_or_render(&b_book, b).unwrap();
+        assert_eq!(cache.renders(), before, "B's book was not evicted by A's list");
+        cache.get_or_render(&spec(1), a).unwrap();
+        assert_eq!(cache.renders(), before + 1, "A's oldest went (her share)");
+        // sizes: answered without a render, even for evicted bytes
+        let n = cache.renders();
+        for i in 1..=PER_USER_ENTRIES + 4 {
+            cache.size_of(&spec(i), a).unwrap();
+        }
+        assert_eq!(cache.size_of(&b_book, b).unwrap(), b_size);
+        assert_eq!(cache.renders(), n, "every size was remembered");
+    }
+
+    /// The async helpers run on the blocking pool and answer the same bytes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn renders_run_off_the_async_workers() {
+        let bytes = render_async(sample(), None).await.unwrap();
+        assert_eq!(*bytes, render(&sample()).unwrap());
+        assert_eq!(sizes_async(vec![sample()], None).await.unwrap(), vec![bytes.len()]);
     }
 
     #[test]
